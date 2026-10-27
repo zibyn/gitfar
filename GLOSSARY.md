@@ -43,3 +43,7 @@ _Avoid_: token（单独使用时）、API key、仓库凭证
 **令牌范围**（Token Scope）:
 一个客户端访问令牌可读的规范 URL 前缀集合；未声明时为全局。
 _Avoid_: 权限组、ACL
+
+**续读游标**（Continuation Cursor）:
+截断结果附带的不透明标记；单独交回服务端，即可在同一解析提交上取得后续内容。
+_Avoid_: 分页 token、offset、会话
