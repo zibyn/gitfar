@@ -10,6 +10,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Deserializer};
 
+use crate::authz::canonicalize;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -193,8 +195,34 @@ impl Config {
             cred.token = resolve_secret(&cred.token)
                 .map_err(|e| err(format!("credentials {:?}: {e}", cred.prefix)))?;
         }
+        canonicalize_all(&mut c.allowlist, "allowlist")?;
+        canonicalize_all(&mut c.warm_list, "warm_list")?;
+        for t in &mut c.client_tokens {
+            if let Some(scope) = &mut t.scope {
+                canonicalize_all(scope, &format!("client_tokens {:?} scope", t.id))?;
+            }
+        }
+        let mut prefixes = HashSet::new();
+        for cred in &mut c.credentials {
+            cred.prefix =
+                canonicalize(&cred.prefix).map_err(|e| err(format!("credentials: {e}")))?;
+            // One URL maps to exactly one credential (spec §4.4).
+            if !prefixes.insert(cred.prefix.clone()) {
+                return Err(err(format!(
+                    "duplicate credentials prefix {:?}",
+                    cred.prefix
+                )));
+            }
+        }
         Ok(c)
     }
+}
+
+fn canonicalize_all(prefixes: &mut [String], key: &str) -> Result<(), ConfigError> {
+    for p in prefixes {
+        *p = canonicalize(p).map_err(|e| err(format!("{key}: {e}")))?;
+    }
+    Ok(())
 }
 
 fn is_sha256_hash(s: &str) -> bool {
