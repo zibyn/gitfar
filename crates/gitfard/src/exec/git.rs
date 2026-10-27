@@ -15,7 +15,11 @@ use crate::cache::RepoCache;
 /// git children running at once, across all requests (spec: default = cores).
 pub(super) fn semaphore() -> &'static Semaphore {
     static S: OnceLock<Semaphore> = OnceLock::new();
-    S.get_or_init(|| Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get())))
+    S.get_or_init(|| Semaphore::new(limit()))
+}
+
+pub(super) fn limit() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
 }
 
 /// Runs git in one cached repo. Callers pass only resolved 40-hex SHAs as revs and put every

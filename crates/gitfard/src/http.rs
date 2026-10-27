@@ -44,7 +44,7 @@ fn primitive(p: Primitive, config: Arc<ConfigHandle>, cache: Arc<RepoCache>) -> 
     post(
         move |Extension(t): Extension<TokenCtx>, body: Bytes| async move {
             let res = match serde_json::from_slice(&body) {
-                Ok(body) => crate::exec::run(&config, &cache, t.scope.as_deref(), p, body).await,
+                Ok(body) => crate::exec::run(&config, &cache, &t, p, body).await,
                 Err(e) => Err(ErrorBody::new(ErrorCode::InvalidArgument, e.to_string())),
             };
             match res {

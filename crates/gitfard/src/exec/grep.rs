@@ -20,6 +20,7 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContex
 use rayon::prelude::*;
 
 use super::{internal, invalid, next, BYTE_CAP};
+use crate::admin::METRICS;
 
 const DEFAULT_RESULTS: u32 = 100;
 const LARGE: u64 = 10_000_000;
@@ -49,6 +50,16 @@ static ENGINE: OnceLock<Engine> = OnceLock::new();
 /// settings, so only the first call counts; without one, defaults are used.
 pub fn init(threads: usize, lru_budget: Option<u64>, max_object: u64) {
     let _ = ENGINE.set(Engine::new(threads, lru_budget, max_object));
+}
+
+/// Blob LRU bytes held and budget, and scan pool size (for `/metrics`).
+pub(crate) fn stats() -> (u64, u64, usize) {
+    let e = engine();
+    (
+        e.blobs.weight(),
+        e.blobs.capacity(),
+        e.pool.current_num_threads(),
+    )
 }
 
 fn engine() -> &'static Engine {
@@ -200,7 +211,10 @@ pub(super) fn run(
                             context,
                             skip_large,
                         };
-                        scan(engine, repo, searcher, &how, f)
+                        METRICS.scan_busy.inc();
+                        let res = scan(engine, repo, searcher, &how, f);
+                        METRICS.scan_busy.dec();
+                        res
                     },
                 )
                 .collect()
@@ -288,8 +302,12 @@ fn scan(
 ) -> Result<Scanned, ErrorBody> {
     let (mode, skip_large) = (how.mode, how.skip_large);
     let data = match engine.blobs.get(&f.oid) {
-        Some(d) => d,
+        Some(d) => {
+            METRICS.blob_hits.inc();
+            d
+        }
         None => {
+            METRICS.blob_misses.inc();
             if skip_large && repo.find_header(f.oid).map_err(internal)?.size() > LARGE {
                 return Ok(Scanned::Large);
             }

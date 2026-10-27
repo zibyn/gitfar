@@ -1,5 +1,6 @@
 //! gitfard: the gitfar server.
 
+pub mod admin;
 pub mod authz;
 pub mod cache;
 pub mod config;
