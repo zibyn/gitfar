@@ -378,6 +378,22 @@ async fn expired_branch_ttl_fetches_once_for_concurrent_requests() {
 }
 
 #[tokio::test]
+async fn fetch_makes_head_follow_a_renamed_upstream_default_branch() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let ttl = Duration::from_millis(100);
+    let cache = fx.open_refreshing(2, Path::new("git"), ttl, WAIT);
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    let up = fx.tmp.path().join("up/example.com/acme/x.git");
+    git(&up, &["branch", "-m", "trunk", "main"]);
+    tokio::time::sleep(ttl).await;
+
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    assert_eq!(git(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main\n");
+}
+
+#[tokio::test]
 async fn within_branch_ttl_requests_do_not_fetch() {
     let fx = Fixture::new();
     let url = fx.upstream("x");

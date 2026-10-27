@@ -370,6 +370,9 @@ impl RepoCache {
                 "+refs/tags/*:refs/tags/*",
             ]);
             let res = run(fetch).await;
+            if res.is_ok() {
+                self.follow_head(&path, &remote, cred).await;
+            }
             self.record(url, &res);
             let ok = if res.is_ok() { "ok" } else { "error" };
             METRICS
@@ -425,6 +428,30 @@ impl RepoCache {
                 f.cred_invalid = true;
             }
         });
+    }
+
+    /// Points HEAD at the upstream default branch, which a fetch alone never moves (§4.5).
+    /// Best effort: on failure HEAD stays as it was.
+    async fn follow_head(&self, repo: &Path, remote: &str, cred: Option<&Credential>) {
+        let mut ls = self.git(cred);
+        ls.args(["ls-remote", "--symref", "--", remote, "HEAD"]);
+        let out = match run_out(ls).await {
+            Ok(out) => out,
+            Err(e) => return tracing::warn!(remote, error = %e, "reading upstream HEAD failed"),
+        };
+        let out = String::from_utf8_lossy(&out);
+        let Some(head) = out.lines().find_map(|l| {
+            l.strip_prefix("ref: ")?
+                .strip_suffix("\tHEAD")
+                .filter(|r| r.starts_with("refs/heads/"))
+        }) else {
+            return;
+        };
+        let mut set = self.git(None);
+        set.arg("-C").arg(repo).args(["symbolic-ref", "HEAD", head]);
+        if let Err(e) = run(set).await {
+            tracing::warn!(remote, head, error = %e, "updating HEAD failed");
+        }
     }
 
     async fn write_commit_graph(&self, repo: &Path) -> Result<(), GitError> {
@@ -899,10 +926,15 @@ impl std::fmt::Display for GitError {
     }
 }
 
-async fn run(mut c: Command) -> Result<(), GitError> {
+async fn run(c: Command) -> Result<(), GitError> {
+    run_out(c).await.map(drop)
+}
+
+/// Like [`run`], returning stdout.
+async fn run_out(mut c: Command) -> Result<Vec<u8>, GitError> {
     let out = c.output().await.map_err(GitError::msg)?;
     if out.status.success() {
-        return Ok(());
+        return Ok(out.stdout);
     }
     let raw = String::from_utf8_lossy(&out.stderr);
     let mut retry_after = None;
