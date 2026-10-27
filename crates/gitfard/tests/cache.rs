@@ -479,6 +479,211 @@ async fn fetch_repacks_when_there_are_more_than_16_packs() {
     assert!(packs(&repo) <= 2, "{} packs", packs(&repo));
 }
 
+/// A `git` wrapper that logs every clone and fetch start/end to `ops.log`. While `<tmp>/limited`
+/// exists (content: `<status> [<retry-after secs>]`) they fail the way git reports an HTTP error
+/// under `GIT_TRACE_CURL`; while `<tmp>/missing` exists, the way it reports a 404. `slow` slows them.
+fn upstream_git(fx: &Fixture) -> PathBuf {
+    let path = fx.tmp.path().join("upstream-git");
+    let dir = fx.tmp.path().display();
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+case " $* " in *" fetch "*|*" clone "*)
+  case " $* " in *" fetch "*) op=fetch;; *) op=clone;; esac
+  echo "+$op" >> '{dir}/ops.log'
+  [ -e '{dir}/slow' ] && sleep 0.5
+  if [ -e '{dir}/limited' ]; then
+    read status after < '{dir}/limited'
+    echo "12:00:00.000000 http.c:756          <= Recv header: HTTP/2 $status" >&2
+    [ -n "$after" ] && echo "12:00:00.000000 http.c:756          <= Recv header: Retry-After: $after" >&2
+    echo "12:00:00.000000 http.c:756          => Send header: Authorization: Basic <redacted>" >&2
+    echo "fatal: unable to access 'https://example.com/': The requested URL returned error: $status" >&2
+    echo "-$op" >> '{dir}/ops.log'
+    exit 128
+  fi
+  if [ -e '{dir}/missing' ]; then
+    echo "remote: Repository not found." >&2
+    echo "fatal: repository 'https://example.com/acme/x.git/' not found" >&2
+    echo "-$op" >> '{dir}/ops.log'
+    exit 128
+  fi
+  git "$@"; rc=$?
+  echo "-$op" >> '{dir}/ops.log'
+  exit $rc;;
+esac
+exec git "$@"
+"#
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&path).status().unwrap();
+    path
+}
+
+impl Fixture {
+    fn open_limited(&self, branch_ttl: Duration, upstream: &str) -> Arc<RepoCache> {
+        let base = format!("file://{}/up/", self.tmp.path().display());
+        let limits: gitfard::config::Upstream = toml::from_str(upstream).unwrap();
+        Arc::new(
+            RepoCache::open(&self.cache_dir(), 2)
+                .unwrap()
+                .with_upstream(&base, &upstream_git(self))
+                .with_refresh(branch_ttl, WAIT)
+                .with_limits(&limits),
+        )
+    }
+
+    /// `+op` / `-op` lines: each clone or fetch start and end, in order.
+    fn ops(&self) -> Vec<String> {
+        std::fs::read_to_string(self.tmp.path().join("ops.log"))
+            .map_or(vec![], |s| s.lines().map(str::to_owned).collect())
+    }
+
+    fn count(&self, op: &str) -> usize {
+        let start = format!("+{op}");
+        self.ops().iter().filter(|l| **l == start).count()
+    }
+
+    fn limit(&self, line: &str) {
+        std::fs::write(self.tmp.path().join("limited"), line).unwrap();
+    }
+
+    fn unlimit(&self) {
+        std::fs::remove_file(self.tmp.path().join("limited")).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rate_limited_fetch_cools_the_host_for_retry_after_and_answers_the_old_sha() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_limited(Duration::ZERO, "");
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    let old = trunk(&repo);
+    std::fs::remove_file(fx.tmp.path().join("ops.log")).unwrap();
+    fx.limit("429 2");
+
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    assert_eq!(fx.count("fetch"), 1);
+    let cooling = cache.cooldowns();
+    assert_eq!(cooling.len(), 1);
+    assert_eq!(cooling[0].0, "example.com");
+    assert!(
+        cooling[0].1 > Duration::from_millis(1500) && cooling[0].1 <= Duration::from_secs(2),
+        "{cooling:?}"
+    );
+
+    // While cooling, due fetches are skipped and requests answer from the old SHA.
+    fx.unlimit();
+    let new = fx.commit("x");
+    assert_eq!(cache.ensure(&url, None, WAIT).await.unwrap(), repo);
+    assert_eq!(fx.count("fetch"), 1);
+    assert_eq!(trunk(&repo), old);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(cache.cooldowns().is_empty());
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    assert_eq!(fx.count("fetch"), 2);
+    assert_eq!(trunk(&repo), new);
+}
+
+#[tokio::test]
+async fn rate_limit_without_retry_after_backs_off_from_the_initial_cooldown() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_limited(Duration::ZERO, "cooldown_initial = \"10s\"");
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    fx.limit("503");
+
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    let cooling = cache.cooldowns();
+    assert!(
+        cooling[0].1 > Duration::from_secs(7) && cooling[0].1 <= Duration::from_secs(10),
+        "{cooling:?}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_clone_stays_queued_and_reports_rate_limited() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_limited(Duration::from_secs(3600), "");
+    fx.limit("429 1");
+
+    let err = cache
+        .ensure(&url, None, Duration::from_millis(500))
+        .await
+        .unwrap_err();
+    assert_eq!(err.error.code, ErrorCode::RepoWarming);
+    assert_eq!(err.error.progress.unwrap().state, WarmingState::RateLimited);
+    let queue = cache.clone_queue();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].0, url);
+    assert_eq!(queue[0].1.state, WarmingState::RateLimited);
+
+    // Not negatively cached: once the cooldown ends the queued clone runs again.
+    fx.unlimit();
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    assert_eq!(fx.count("clone"), 2);
+    assert!(cache.clone_queue().is_empty());
+}
+
+#[tokio::test]
+async fn missing_repo_is_not_found_and_upstream_is_not_asked_again_within_the_negative_cache_ttl() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_limited(Duration::from_secs(3600), "negative_cache_ttl = \"1s\"");
+    fx.touch("missing");
+
+    for _ in 0..3 {
+        let err = cache.ensure(&url, None, WAIT).await.unwrap_err();
+        assert_eq!(err.error.code, ErrorCode::NotFound);
+    }
+    assert_eq!(fx.count("clone"), 1);
+
+    std::fs::remove_file(fx.tmp.path().join("missing")).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    assert_eq!(fx.count("clone"), 2);
+}
+
+#[tokio::test]
+async fn fifth_concurrent_fetch_to_one_host_waits() {
+    let fx = Fixture::new();
+    let urls: Vec<_> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|n| fx.upstream(n))
+        .collect();
+    let cache = fx.open_limited(Duration::ZERO, "");
+    for url in &urls {
+        cache.ensure(url, None, WAIT).await.unwrap();
+    }
+    std::fs::remove_file(fx.tmp.path().join("ops.log")).unwrap();
+    fx.touch("slow");
+
+    let tasks: Vec<_> = urls
+        .iter()
+        .map(|url| {
+            let (cache, url) = (cache.clone(), url.clone());
+            tokio::spawn(async move { cache.ensure(&url, None, WAIT).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+
+    let (mut running, mut peak) = (0, 0);
+    for op in fx.ops() {
+        running += if op.starts_with('+') { 1 } else { -1 };
+        peak = peak.max(running);
+    }
+    assert_eq!(fx.count("fetch"), 5);
+    assert_eq!(peak, 4, "{:?}", fx.ops());
+}
+
 // ---- 淘汰, cache_full, 维护 (spec §4.5) ----
 
 /// Writes `<tmp>/gitfard.toml` with the given top-level and `[cache]` keys; `allowlist`
