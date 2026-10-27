@@ -40,9 +40,21 @@ impl Git {
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let deadline = self.deadline;
         let fut = async move {
             let _permit = semaphore().acquire().await.map_err(internal)?;
+            // Never start git past the deadline: a fast git could otherwise beat the timeout.
+            if Instant::now() >= deadline {
+                return Err(deadline_exceeded());
+            }
             let mut child = cmd.spawn().map_err(internal)?;
+            // Drained alongside stdout, so a chatty git never blocks on a full stderr pipe.
+            let mut stderr = child.stderr.take().expect("piped");
+            let stderr = tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = stderr.read_to_end(&mut buf).await;
+                buf
+            });
             let mut out = Vec::new();
             let stdout = child.stdout.take().expect("piped");
             stdout
@@ -54,11 +66,12 @@ impl Git {
                 // The caller has all it can use; the rest may be large.
                 return Ok(out);
             }
-            let done = child.wait_with_output().await.map_err(internal)?;
-            if done.status.success() {
+            let status = child.wait().await.map_err(internal)?;
+            if status.success() {
                 return Ok(out);
             }
-            let err = String::from_utf8_lossy(&done.stderr);
+            let stderr = stderr.await.map_err(internal)?;
+            let err = String::from_utf8_lossy(&stderr);
             let err = err.trim();
             // Bad user input git rejects itself, e.g. an invalid `--grep` regex.
             if err.starts_with("fatal: command line") {
@@ -69,16 +82,18 @@ impl Git {
         };
         // The child is `kill_on_drop`, so a timeout kills it.
         tokio::runtime::Handle::current().block_on(async {
-            tokio::time::timeout_at(self.deadline.into(), fut)
+            tokio::time::timeout_at(deadline.into(), fut)
                 .await
-                .unwrap_or_else(|_| {
-                    Err(ErrorBody::new(
-                        ErrorCode::DeadlineExceeded,
-                        "git did not finish within the request deadline",
-                    ))
-                })
+                .unwrap_or_else(|_| Err(deadline_exceeded()))
         })
     }
+}
+
+fn deadline_exceeded() -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::DeadlineExceeded,
+        "git did not finish within the request deadline",
+    )
 }
 
 /// User path prefixes as literal pathspecs; `""`/`/` (the root) is dropped since git rejects it.

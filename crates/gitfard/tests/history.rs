@@ -441,3 +441,30 @@ async fn git_past_the_request_deadline_is_deadline_exceeded() {
         assert_eq!(r["error"]["code"], "deadline_exceeded");
     }
 }
+
+#[tokio::test]
+async fn git_writing_lots_of_stderr_still_completes() {
+    let mut fx = Fx::with_server("request_deadline = \"10s\"");
+    // More stderr than a pipe buffer holds, before any stdout.
+    let chatty = fx.tmp.path().join("chatty-git");
+    std::fs::write(
+        &chatty,
+        "#!/bin/sh\nhead -c 1000000 /dev/zero | tr '\\0' x >&2\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    Command::new("chmod")
+        .arg("+x")
+        .arg(&chatty)
+        .status()
+        .unwrap();
+    let base = format!("file://{}/up/", fx.tmp.path().display());
+    fx.cache = Arc::new(
+        RepoCache::open(&fx.tmp.path().join("cache2"), 2)
+            .unwrap()
+            .with_upstream(&base, &chatty),
+    );
+    let t = std::time::Instant::now();
+    let r = fx.ok("log", json!({ "repo": REPO })).await;
+    assert_eq!(r["resolved_commit"], fx.last);
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+}
