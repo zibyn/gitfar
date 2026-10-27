@@ -93,13 +93,7 @@ async fn main() -> ExitCode {
         cfg.cache.blob_lru_max_object,
     );
     let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
-        // shortcut: branch_ttl/fetch_timeout are read once; a SIGHUP reload doesn't change them.
-        Ok(c) => Arc::new(
-            c.with_refresh(cfg.cache.branch_ttl, cfg.cache.fetch_timeout)
-                .with_config(handle.clone())
-                // shortcut: [upstream] is read once; a SIGHUP reload doesn't change it.
-                .with_limits(&handle.current().upstream),
-        ),
+        Ok(c) => Arc::new(c.with_config(handle.clone())),
         Err(e) => {
             eprintln!("gitfard: {e}");
             return ExitCode::FAILURE;
@@ -140,24 +134,18 @@ async fn main() -> ExitCode {
     });
 
     for url in &cfg.warm_list {
-        match authorize(&cfg, None, url) {
-            Ok(cred) => cache.preheat(url, cred),
-            Err(_) => tracing::warn!(url, "warm_list entry outside the allowlist; skipped"),
+        if authorize(&cfg, None, url).is_err() {
+            tracing::warn!(url, "warm_list entry outside the allowlist; skipped");
         }
     }
     // 预热列表 repos stay fresh in the background; others refresh only when requested.
-    let (bg, ttl) = (cache.clone(), cfg.cache.branch_ttl);
-    let bg_config = handle.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(ttl);
-        loop {
-            tick.tick().await;
-            let cfg = bg_config.current();
-            for url in &cfg.warm_list {
-                if let Ok(cred) = authorize(&cfg, None, url) {
-                    let (cache, url, cred) = (bg.clone(), url.clone(), cred.cloned());
-                    tokio::spawn(async move { cache.refresh(&url, cred.as_ref()).await });
-                }
+    tokio::spawn({
+        let (cache, handle) = (cache.clone(), handle.clone());
+        async move {
+            loop {
+                cache.refresh_warm_list();
+                let ttl = handle.current().cache.branch_ttl;
+                tokio::time::sleep(ttl.max(std::time::Duration::from_secs(1))).await;
             }
         }
     });

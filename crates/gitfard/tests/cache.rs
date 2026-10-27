@@ -913,3 +913,40 @@ async fn removing_a_repo_keeps_one_lock_for_its_url() {
     assert!(!cache.path(&url).exists());
     assert!(Arc::ptr_eq(&held, &cache.lock(&url)));
 }
+
+// ---- SIGHUP hot reload (spec §4.1) ----
+
+#[tokio::test]
+async fn reloaded_branch_ttl_applies_to_cached_repos() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let (cache, cfg) = open_with(&fx, &fx.fetch_git());
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    let new = fx.commit("x");
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    assert_eq!(fx.fetches(), 0, "within the default 60 s TTL");
+
+    write_config(&fx, "", "branch_ttl = \"0s\"");
+    cfg.reload().unwrap();
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    assert_eq!(fx.fetches(), 1);
+    assert_eq!(trunk(&repo), new);
+}
+
+#[tokio::test]
+async fn warm_list_entries_added_by_reload_are_warmed() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let (cache, cfg) = open_with(&fx, Path::new("git"));
+    write_config(&fx, &format!("warm_list = [\"{url}\"]"), "");
+    cfg.reload().unwrap();
+
+    cache.refresh_warm_list();
+
+    let deadline = Instant::now() + WAIT;
+    while !cache.path(&url).exists() {
+        assert!(Instant::now() < deadline, "warm_list repo never cloned");
+        tokio::time::sleep(SHORT).await;
+    }
+}

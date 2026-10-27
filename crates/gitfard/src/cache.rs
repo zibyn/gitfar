@@ -66,8 +66,9 @@ pub struct RepoCache {
 
 /// Per-host upstream state (in memory only).
 struct Host {
-    /// Clone + fetch concurrency for this host.
+    /// Clone + fetch concurrency for this host, sized `slots_size` (0 = not sized yet).
     slots: Arc<Semaphore>,
+    slots_size: usize,
     /// 冷却 end, if one was ever set.
     cool_until: Option<Instant>,
     /// Consecutive rate limits, for the exponential backoff; reset by any success.
@@ -140,7 +141,7 @@ impl RepoCache {
         })
     }
 
-    /// Reads `disk_budget`, `disk_min_free`, `warm_list`, `allowlist` and `maintenance_window` live.
+    /// Reads `[cache]`, `[upstream]`, `warm_list` and `allowlist` live, so a SIGHUP reload applies.
     pub fn with_config(mut self, config: Arc<ConfigHandle>) -> RepoCache {
         self.config = Some(config);
         self
@@ -167,14 +168,14 @@ impl RepoCache {
         self
     }
 
-    /// `branch_ttl` and `fetch_timeout` from `[cache]` (defaults 60 s and 5 s).
+    /// `branch_ttl` and `fetch_timeout` (defaults 60 s and 5 s) when no config is attached.
     pub fn with_refresh(mut self, branch_ttl: Duration, fetch_timeout: Duration) -> RepoCache {
         self.branch_ttl = branch_ttl;
         self.fetch_timeout = fetch_timeout;
         self
     }
 
-    /// `[upstream]`: host concurrency, 冷却 backoff, 负缓存 TTL.
+    /// `[upstream]` (host concurrency, 冷却 backoff, 负缓存 TTL) when no config is attached.
     pub fn with_limits(mut self, limits: &Upstream) -> RepoCache {
         self.limits = limits.clone();
         self
@@ -254,9 +255,21 @@ impl RepoCache {
         locks.entry(url.to_owned()).or_default().clone()
     }
 
-    /// 预热 without waiting (预热列表 at startup). No-op if cached or already warming.
-    pub fn preheat(self: &Arc<Self>, url: &str, cred: Option<&Credential>) {
-        self.warm(url, cred);
+    /// 预热列表 upkeep (main calls it at startup and every branch TTL): 预热s entries not cached
+    /// yet, e.g. added by a reload, and refreshes the rest in the background.
+    pub fn refresh_warm_list(self: &Arc<Self>) {
+        let Some(cfg) = self.config() else {
+            return;
+        };
+        for url in &cfg.warm_list {
+            let Ok(cred) = authorize(&cfg, None, url) else {
+                continue;
+            };
+            if self.warm(url, cred).is_none() {
+                let (this, url, cred) = (self.clone(), url.clone(), cred.cloned());
+                tokio::spawn(async move { this.refresh(&url, cred.as_ref()).await });
+            }
+        }
     }
 
     /// Returns the cached repo's path, cloning it first if needed and waiting up to `wait`
@@ -316,7 +329,7 @@ impl RepoCache {
     /// the fetch's start; on timeout or failure the old refs stay and the fetch carries on.
     /// Concurrent callers share one fetch. Also drives background refresh of the 预热列表.
     pub async fn refresh(self: &Arc<Self>, url: &str, cred: Option<&Credential>) {
-        let ttl = self.branch_ttl;
+        let ttl = self.branch_ttl();
         self.fetch_if(url, cred, |f| f.checked.is_none_or(|t| t.elapsed() >= ttl))
             .await;
     }
@@ -362,7 +375,7 @@ impl RepoCache {
             f.running.clone()
         });
         if let Some((started, mut done)) = running {
-            let deadline = started + self.fetch_timeout;
+            let deadline = started + self.fetch_timeout();
             let _ = timeout_at(deadline.into(), done.wait_for(|d| *d)).await;
         }
     }
@@ -549,7 +562,7 @@ impl RepoCache {
                     }
                     Err(Failed::Final(code, negative)) => {
                         if negative {
-                            let until = Instant::now() + this.limits.negative_cache_ttl;
+                            let until = Instant::now() + this.limits().negative_cache_ttl;
                             let mut st = this.state.lock().unwrap();
                             st.negative.insert(job.url.clone(), (until, code));
                         }
@@ -605,17 +618,45 @@ impl RepoCache {
 
     /// Waits for one of this host's clone + fetch slots.
     async fn slot(&self, url: &str) -> OwnedSemaphorePermit {
-        let slots = self.host_state(url, |h| h.slots.clone());
+        let size = self.limits().host_concurrency.max(1);
+        let slots = self.host_state(url, |h| {
+            // A reloaded `host_concurrency` takes a fresh semaphore.
+            // shortcut: permits held on the old one don't count against it, so the host can briefly
+            // see old + new slots; drain the old one first if that ever matters.
+            if h.slots_size != size {
+                (h.slots, h.slots_size) = (Arc::new(Semaphore::new(size)), size);
+            }
+            h.slots.clone()
+        });
         slots.acquire_owned().await.expect("never closed")
     }
 
     fn host_state<T>(&self, url: &str, f: impl FnOnce(&mut Host) -> T) -> T {
         let mut hosts = self.hosts.lock().unwrap();
         f(hosts.entry(host(url).to_owned()).or_insert_with(|| Host {
-            slots: Arc::new(Semaphore::new(self.limits.host_concurrency.max(1))),
+            slots: Arc::new(Semaphore::new(0)),
+            slots_size: 0,
             cool_until: None,
             strikes: 0,
         }))
+    }
+
+    /// `branch_ttl`, live from the config when attached.
+    fn branch_ttl(&self) -> Duration {
+        self.config()
+            .map_or(self.branch_ttl, |c| c.cache.branch_ttl)
+    }
+
+    /// `fetch_timeout`, live from the config when attached.
+    fn fetch_timeout(&self) -> Duration {
+        self.config()
+            .map_or(self.fetch_timeout, |c| c.cache.fetch_timeout)
+    }
+
+    /// `[upstream]`, live from the config when attached.
+    fn limits(&self) -> Upstream {
+        self.config()
+            .map_or_else(|| self.limits.clone(), |c| c.upstream.clone())
     }
 
     fn cooling(&self, host: &str) -> bool {
@@ -636,13 +677,13 @@ impl RepoCache {
         if !e.rate_limited() {
             return;
         }
+        let limits = self.limits();
         let until = self.host_state(url, |h| {
             h.strikes += 1;
-            let backoff = self
-                .limits
+            let backoff = limits
                 .cooldown_initial
                 .saturating_mul(1 << (h.strikes - 1).min(16))
-                .min(self.limits.cooldown_max)
+                .min(limits.cooldown_max)
                 .mul_f64(rand::rng().random_range(0.8..=1.0));
             let until = Instant::now() + e.retry_after.unwrap_or(backoff);
             h.cool_until = h.cool_until.max(Some(until));
