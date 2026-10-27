@@ -90,7 +90,11 @@ async fn main() -> ExitCode {
     let cfg = handle.current();
     let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
         // shortcut: branch_ttl/fetch_timeout are read once; a SIGHUP reload doesn't change them.
-        Ok(c) => Arc::new(c.with_refresh(cfg.cache.branch_ttl, cfg.cache.fetch_timeout)),
+        // shortcut: [upstream] is read once too.
+        Ok(c) => Arc::new(
+            c.with_refresh(cfg.cache.branch_ttl, cfg.cache.fetch_timeout)
+                .with_limits(&cfg.upstream),
+        ),
         Err(e) => {
             eprintln!("gitfard: {e}");
             return ExitCode::FAILURE;
