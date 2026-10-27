@@ -88,6 +88,17 @@ pub struct MaintenanceWindow {
     pub end_minute: u16,
 }
 
+impl MaintenanceWindow {
+    pub fn contains(&self, minute: u16) -> bool {
+        let (s, e) = (self.start_minute, self.end_minute);
+        if s <= e {
+            (s..e).contains(&minute)
+        } else {
+            minute >= s || minute < e
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {

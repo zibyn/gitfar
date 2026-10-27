@@ -2,7 +2,10 @@
 //!
 //! Layout under `cache_dir`: `lock` (single-process file lock), `tmp/<n>` (clones in progress,
 //! wiped at startup), `repos/<规范 URL>.git` (finished full bare clones, each with a `gitfar-access`
-//! touch file whose mtime is the last access).
+//! touch file whose mtime is the last access, and a `gitfar-gc` file whose mtime is the last full gc).
+//!
+//! With a config attached, the cache also enforces `disk_budget` (LRU 淘汰), `disk_min_free`
+//! (`cache_full`) and runs the daily maintenance window from [`RepoCache::tick`].
 //!
 //! 上游限速 (§4.5): clones and fetches take a per-host slot; a 429/503 puts the whole host in
 //! 冷却 (due fetches skipped, queued clones held); deterministic clone failures are 负缓存'd.
@@ -23,13 +26,19 @@ use tokio::process::Command;
 use tokio::sync::{watch, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::timeout_at;
 
-use crate::config::{Credential, Upstream};
+use crate::authz::authorize;
+use crate::config::{Config, ConfigHandle, Credential, Upstream};
 
 const TOUCH_FILE: &str = "gitfar-access";
 /// An unresolvable rev triggers a fetch only if the last successful one is older than this (§4.5).
 const REV_REFETCH_AFTER: Duration = Duration::from_secs(60);
 /// More packs than this after a fetch triggers a geometric repack (§4.5 维护).
 const MAX_PACKS: usize = 16;
+const GC_FILE: &str = "gitfar-gc";
+/// A repo is due for full gc once per maintenance window; anything shorter than a day works.
+const GC_EVERY: Duration = Duration::from_secs(12 * 3600);
+/// How often a running clone checks free disk and the budget.
+const CLONE_POLL: Duration = Duration::from_millis(500);
 
 type Outcome = watch::Receiver<Option<Result<(), ErrorCode>>>;
 
@@ -46,6 +55,10 @@ pub struct RepoCache {
     branch_ttl: Duration,
     fetch_timeout: Duration,
     fresh: Mutex<HashMap<String, Freshness>>,
+    /// `None` (tests only): no budget, no free-disk floor, no maintenance.
+    config: Option<Arc<ConfigHandle>>,
+    /// One 淘汰 pass at a time, so concurrent passes don't each evict for the same overrun.
+    evicting: tokio::sync::Mutex<()>,
     limits: Upstream,
     hosts: Mutex<HashMap<String, Host>>,
 }
@@ -121,7 +134,29 @@ impl RepoCache {
             fresh: Mutex::default(),
             limits: Upstream::default(),
             hosts: Mutex::default(),
+            config: None,
+            evicting: tokio::sync::Mutex::default(),
         })
+    }
+
+    /// Reads `disk_budget`, `disk_min_free`, `warm_list`, `allowlist` and `maintenance_window` live.
+    pub fn with_config(mut self, config: Arc<ConfigHandle>) -> RepoCache {
+        self.config = Some(config);
+        self
+    }
+
+    /// Periodic housekeeping (main calls it every minute with the local minute of day): 淘汰 down
+    /// to budget, resume clones paused for low disk, and inside the maintenance window full gc
+    /// of due repos plus removal of repos no longer allowlisted.
+    pub async fn tick(self: &Arc<Self>, now_minute: u16) {
+        let Some(cfg) = self.config() else {
+            return;
+        };
+        self.evict().await;
+        self.pump(&mut self.state.lock().unwrap());
+        if cfg.cache.maintenance_window.contains(now_minute) {
+            self.maintain(&cfg).await;
+        }
     }
 
     /// Clone from `<base><规范 URL>.git` using the `git` executable at `git` (tests: `file://` fixtures).
@@ -221,7 +256,7 @@ impl RepoCache {
                 format!("upstream rejected the credential for {url}"),
             ));
         }
-        touch(&path);
+        touch(&path.join(TOUCH_FILE));
         Ok(path)
     }
 
@@ -371,6 +406,9 @@ impl RepoCache {
         if let Some(outcome) = st.warming.get(url) {
             return Some(outcome.clone());
         }
+        if self.disk_low() {
+            return Some(watch::channel(Some(Err(ErrorCode::CacheFull))).1);
+        }
         let (done, outcome) = watch::channel(None);
         st.warming.insert(url.to_owned(), outcome.clone());
         st.queue.push_back(Job {
@@ -382,9 +420,9 @@ impl RepoCache {
         Some(outcome)
     }
 
-    /// Starts queued clones, FIFO, up to the concurrency limit.
+    /// Starts queued clones, FIFO, up to the concurrency limit. Paused while disk is low; `tick` resumes.
     fn pump(self: &Arc<Self>, st: &mut State) {
-        while st.running < self.concurrency {
+        while st.running < self.concurrency && !self.disk_low() {
             // Clones to a cooling host stay queued; the cooldown's end pumps again.
             let Some(i) = st.queue.iter().position(|j| !self.cooling(host(&j.url))) else {
                 return;
@@ -422,11 +460,14 @@ impl RepoCache {
                         }
                     });
                 }
-                let mut st = this.state.lock().unwrap();
-                st.warming.remove(&job.url);
-                st.running -= 1;
-                this.pump(&mut st);
+                {
+                    let mut st = this.state.lock().unwrap();
+                    st.warming.remove(&job.url);
+                    st.running -= 1;
+                    this.pump(&mut st);
+                }
                 job.done.send_replace(Some(res));
+                this.evict().await;
             });
         }
     }
@@ -516,7 +557,9 @@ impl RepoCache {
         };
         tracing::warn!(url, error = %e, "clone failed");
         let _ = fs::remove_dir_all(&tmp);
-        Err(if e.rate_limited() {
+        Err(if self.disk_low() {
+            Failed::Final(ErrorCode::CacheFull, false)
+        } else if e.rate_limited() {
             Failed::RateLimited
         } else if e.not_found() {
             Failed::Final(ErrorCode::NotFound, true)
@@ -547,7 +590,22 @@ impl RepoCache {
             .arg(tmp);
         let res = {
             let _slot = self.slot(url).await;
-            run(clone).await
+            let out = run(clone);
+            tokio::pin!(out);
+            loop {
+                tokio::select! {
+                    res = &mut out => break res,
+                    _ = tokio::time::sleep(CLONE_POLL) => {
+                        // Dropping `out` kills the clone (kill_on_drop); the caller removes `tmp`.
+                        // shortcut: git's own children (index-pack) may outlive the kill briefly; kill the
+                        // process group if residue shows up after an abort.
+                        if self.disk_low() {
+                            return Err(GitError::msg("free disk below disk_min_free"));
+                        }
+                        self.evict().await;
+                    }
+                }
+            }
         };
         self.record(url, &res);
         res?;
@@ -557,9 +615,130 @@ impl RepoCache {
             .arg(tmp)
             .args(["commit-graph", "write", "--reachable", "--changed-paths"]);
         run(graph).await?;
+        touch(&tmp.join(TOUCH_FILE));
         let dst = self.path(url);
-        fs::create_dir_all(dst.parent().unwrap()).map_err(GitError::io)?;
-        fs::rename(tmp, &dst).map_err(GitError::io)
+        fs::create_dir_all(dst.parent().unwrap()).map_err(GitError::msg)?;
+        fs::rename(tmp, &dst).map_err(GitError::msg)
+    }
+
+    fn config(&self) -> Option<Arc<Config>> {
+        self.config.as_ref().map(|c| c.current())
+    }
+
+    /// Free disk under the cache dir is below `disk_min_free`.
+    fn disk_low(&self) -> bool {
+        let Some(cfg) = self.config() else {
+            return false;
+        };
+        match rustix::fs::statvfs(&self.root) {
+            Ok(s) => s.f_bavail.saturating_mul(s.f_frsize) < cfg.cache.disk_min_free,
+            Err(e) => {
+                tracing::warn!(error = %e, "statvfs failed");
+                false
+            }
+        }
+    }
+
+    /// Canonical URLs of every cached repo.
+    fn repos(&self) -> Vec<String> {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+            for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let url = format!("{prefix}{}", e.file_name().to_string_lossy());
+                match url.strip_suffix(".git") {
+                    Some(repo) => out.push(repo.to_owned()),
+                    None if e.file_type().is_ok_and(|t| t.is_dir()) => {
+                        walk(&e.path(), &format!("{url}/"), out)
+                    }
+                    None => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root.join("repos"), "", &mut out);
+        out
+    }
+
+    /// LRU 淘汰 of whole repos until `repos/` + in-progress clones fit `disk_budget`. 预热列表 repos stay.
+    async fn evict(&self) {
+        let Some(cfg) = self.config() else {
+            return;
+        };
+        let _one = self.evicting.lock().await;
+        let mut repos: Vec<_> = self
+            .repos()
+            .into_iter()
+            .map(|url| {
+                let path = self.path(&url);
+                let used = mtime(&path.join(TOUCH_FILE)).or_else(|| mtime(&path));
+                (used, dir_size(&path), url)
+            })
+            .collect();
+        let budget = cfg.cache.disk_budget;
+        let mut total = dir_size(&self.root.join("tmp")) + repos.iter().map(|r| r.1).sum::<u64>();
+        if total <= budget {
+            return;
+        }
+        repos.sort();
+        for (_, size, url) in repos {
+            if total <= budget {
+                return;
+            }
+            if !cfg.warm_list.contains(&url) {
+                tracing::info!(url, size, "evicting");
+                self.remove(&url).await;
+                total -= size;
+            }
+        }
+        tracing::warn!(total, budget, "warm_list repos alone exceed disk_budget");
+    }
+
+    /// Full gc of due repos and removal of repos outside the allowlist (spec §4.5 维护).
+    async fn maintain(&self, cfg: &Config) {
+        for url in self.repos() {
+            if authorize(cfg, None, &url).is_err() {
+                tracing::info!(url, "removing repo no longer in the allowlist");
+                self.remove(&url).await;
+                continue;
+            }
+            let path = self.path(&url);
+            let marker = path.join(GC_FILE);
+            if mtime(&marker).is_some_and(|t| t.elapsed().is_ok_and(|e| e < GC_EVERY)) {
+                continue;
+            }
+            let lock = self.lock(&url);
+            let _w = lock.write().await;
+            let mut gc = self.git(None);
+            gc.arg("-C").arg(&path).args(["gc", "-q", "--prune=now"]);
+            let mut graph = self.git(None);
+            graph.arg("-C").arg(&path).args([
+                "commit-graph",
+                "write",
+                "--reachable",
+                "--changed-paths",
+            ]);
+            let res = match run(gc).await {
+                Ok(()) => run(graph).await,
+                e => e,
+            };
+            match res {
+                Ok(()) => touch(&marker),
+                Err(e) => tracing::warn!(url, error = %e, "gc failed"),
+            }
+        }
+    }
+
+    /// Deletes a cached repo under its write lock and drops its lock entry.
+    async fn remove(&self, url: &str) {
+        let lock = self.lock(url);
+        let _w = lock.write().await;
+        // Renamed out of `repos/` first, so a half-deleted repo never looks cached.
+        let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
+        let trash = self.root.join("tmp").join(format!("rm-{n}"));
+        let res = fs::rename(self.path(url), &trash).and_then(|_| fs::remove_dir_all(&trash));
+        if let Err(e) = res {
+            tracing::warn!(url, error = %e, "removing repo failed");
+        }
+        self.locks.lock().unwrap().remove(url);
     }
 
     /// A hermetic git child. The credential travels as env-injected `http.<prefix>.extraHeader`
@@ -615,7 +794,7 @@ struct GitError {
 }
 
 impl GitError {
-    fn io(e: io::Error) -> GitError {
+    fn msg(e: impl ToString) -> GitError {
         GitError {
             stderr: e.to_string(),
             retry_after: None,
@@ -644,7 +823,7 @@ impl std::fmt::Display for GitError {
 }
 
 async fn run(mut c: Command) -> Result<(), GitError> {
-    let out = c.output().await.map_err(GitError::io)?;
+    let out = c.output().await.map_err(GitError::msg)?;
     if out.status.success() {
         return Ok(());
     }
@@ -701,15 +880,33 @@ fn count_packs(repo: &Path) -> usize {
     })
 }
 
-/// Records an access for LRU 淘汰; best effort.
-fn touch(repo: &Path) {
+/// Sets `file`'s mtime to now (last access for LRU 淘汰, last full gc); best effort.
+fn touch(file: &Path) {
     let res = File::options()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(repo.join(TOUCH_FILE))
+        .open(file)
         .and_then(|f| f.set_modified(SystemTime::now()));
     if let Err(e) = res {
-        tracing::warn!(repo = %repo.display(), error = %e, "touch failed");
+        tracing::warn!(file = %file.display(), error = %e, "touch failed");
     }
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Apparent bytes of every file under `dir`; 0 if it is gone.
+fn dir_size(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_size(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
