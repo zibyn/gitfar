@@ -216,6 +216,13 @@ impl Config {
         }
         Ok(c)
     }
+
+    /// Zero tokens means every request gets 401 (spec §4.2); say so at startup and on reload.
+    pub fn warn_if_no_client_tokens(&self) {
+        if self.client_tokens.is_empty() {
+            tracing::warn!("no client_tokens configured; every request will be rejected with 401");
+        }
+    }
 }
 
 fn canonicalize_all(prefixes: &mut [String], key: &str) -> Result<(), ConfigError> {
@@ -275,6 +282,7 @@ impl ConfigHandle {
         keep_restart_only(&old, &mut new);
         self.current.store(Arc::new(new));
         tracing::info!("config reloaded");
+        self.current().warn_if_no_client_tokens();
         Ok(())
     }
 }
