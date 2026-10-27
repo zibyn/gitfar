@@ -56,12 +56,14 @@ fn primitive(p: Primitive, config: Arc<ConfigHandle>, cache: Arc<RepoCache>) -> 
 }
 
 fn error(body: ErrorBody) -> Response {
-    let code = body.error.code;
+    let (code, retry_after) = (body.error.code, body.retry_after);
     let status = StatusCode::from_u16(code.http_status()).expect("valid status");
     let mut resp = (status, Json(body)).into_response();
     if code == ErrorCode::RepoWarming {
+        // Whole seconds, rounded up; 5 s when nothing better is known.
+        let secs = retry_after.map_or(5, |d| d.as_secs() + 1);
         resp.headers_mut()
-            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+            .insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
     }
     resp
 }

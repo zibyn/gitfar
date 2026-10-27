@@ -623,6 +623,23 @@ async fn rate_limit_without_retry_after_backs_off_from_the_initial_cooldown() {
 }
 
 #[tokio::test]
+async fn rate_limited_warming_suggests_retrying_when_the_cooldown_ends() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_limited(Duration::from_secs(3600), "");
+    fx.limit("429 30");
+
+    let err = cache.ensure(&url, None, SHORT).await.unwrap_err();
+
+    assert_eq!(err.error.progress.unwrap().state, WarmingState::RateLimited);
+    let left = err.retry_after.unwrap();
+    assert!(
+        left > Duration::from_secs(25) && left <= Duration::from_secs(30),
+        "{left:?}"
+    );
+}
+
+#[tokio::test]
 async fn rate_limited_clone_stays_queued_and_reports_rate_limited() {
     let fx = Fixture::new();
     let url = fx.upstream("x");

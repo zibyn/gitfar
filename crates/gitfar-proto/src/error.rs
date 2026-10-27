@@ -64,6 +64,9 @@ impl ErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorBody {
     pub error: ErrorDetail,
+    /// Server side only: the `Retry-After` for `repo_warming`, when known (e.g. a 冷却's end).
+    #[serde(skip)]
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl ErrorBody {
@@ -74,6 +77,7 @@ impl ErrorBody {
                 message: message.into(),
                 progress: None,
             },
+            retry_after: None,
         }
     }
 }

@@ -582,7 +582,12 @@ impl RepoCache {
     fn warming(&self, url: &str) -> ErrorBody {
         let st = self.state.lock().unwrap();
         let mut body = ErrorBody::new(ErrorCode::RepoWarming, format!("{url} is being cloned"));
-        body.error.progress = Some(self.progress(&st, url));
+        let progress = self.progress(&st, url);
+        if progress.state == WarmingState::RateLimited {
+            let until = self.host_state(url, |h| h.cool_until);
+            body.retry_after = until.map(|t| t.saturating_duration_since(Instant::now()));
+        }
+        body.error.progress = Some(progress);
         body
     }
 
