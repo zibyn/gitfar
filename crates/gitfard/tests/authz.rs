@@ -170,6 +170,10 @@ fn canonicalize_rejects_malformed_urls() {
         "github.com/acme?x=1",
         "github.com/acme#frag",
         "github.com\\acme",
+        // Percent-encoding would let `..` or `/` past the segment checks once decoded.
+        "github.com/acme/%2e%2e/evil",
+        "github.com/acme%2fevil/repo",
+        "github.com/acme/re%70o",
     ] {
         assert!(canonicalize(raw).is_err(), "{raw:?} should be rejected");
     }

@@ -4,13 +4,13 @@
 
 ## 1. 获取二进制或镜像
 
-**OCI 镜像**只含 `gitfard` 与版本固定的 git（见仓库根目录 `Dockerfile`）：
+**OCI 镜像**只含 `gitfard` 与 Debian 发行版的 git（trixie 为 2.47.x；见仓库根目录 `Dockerfile`）：
 
 ```sh
 docker build -t gitfard .
 ```
 
-**裸二进制**（`gitfard` 服务端、`gitfar` CLI）：
+**裸二进制**（`gitfard` 服务端、`gitfar` CLI）：推送 `v*` 标签时 CI 把 linux x86_64 版本附到 GitHub Release；也可自行构建：
 
 ```sh
 cargo build --release -p gitfard -p gitfar   # 产物在 target/release/

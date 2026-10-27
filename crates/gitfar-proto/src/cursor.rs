@@ -77,14 +77,14 @@ impl Request {
     /// Every failure is `invalid_argument`.
     pub fn parse(primitive: Primitive, body: serde_json::Value) -> Result<Self, ErrorBody> {
         let invalid = |why: String| ErrorBody::new(ErrorCode::InvalidArgument, why);
-        if let Some(token) = body.get("cursor") {
+        if let Some(encoded) = body.get("cursor") {
             if body.as_object().is_some_and(|o| o.len() != 1) {
                 return Err(invalid("cursor must be sent alone".into()));
             }
-            let token = token
+            let encoded = encoded
                 .as_str()
                 .ok_or_else(|| invalid("cursor must be a string".into()))?;
-            let cursor = Cursor::decode(token)?;
+            let cursor = Cursor::decode(encoded)?;
             if cursor.resume.primitive() != primitive {
                 return Err(invalid(format!(
                     "cursor belongs to {}",
@@ -116,10 +116,10 @@ impl Cursor {
     }
 
     /// Any failure is `invalid_argument`.
-    pub fn decode(token: &str) -> Result<Self, ErrorBody> {
+    pub fn decode(encoded: &str) -> Result<Self, ErrorBody> {
         let invalid = |why: &str| ErrorBody::new(ErrorCode::InvalidArgument, why);
         let bytes = URL_SAFE_NO_PAD
-            .decode(token)
+            .decode(encoded)
             .map_err(|_| invalid("cursor is not valid base64url"))?;
         let (&version, body) = bytes.split_first().ok_or_else(|| invalid("empty cursor"))?;
         if version != VERSION {

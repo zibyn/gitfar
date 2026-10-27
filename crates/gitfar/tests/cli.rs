@@ -64,7 +64,12 @@ async fn prim(
         return err(code, "boom");
     }
     match repo {
-        "warming" => {
+        // Warming at first, then a retry that hangs.
+        "slow" if seen.hits.load(Ordering::SeqCst) > 1 => {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            ok("late\n".into(), json!({}))
+        }
+        "warming" | "slow" => {
             let mut b = ErrorBody::new(ErrorCode::RepoWarming, "warming up");
             b.error.progress = serde_json::from_value(json!({"state":"cloning"})).unwrap();
             let mut r = (StatusCode::SERVICE_UNAVAILABLE, Json(b)).into_response();
@@ -377,6 +382,17 @@ fn warming_is_retried_with_progress_until_wait_runs_out() {
         took >= Duration::from_secs(2) && took < Duration::from_secs(4),
         "{took:?}"
     );
+}
+
+#[test]
+fn wait_also_bounds_a_retry_in_flight() {
+    let s = Stub::start();
+    let t = Instant::now();
+    let o = s.run(&["--wait", "2", "read", "slow", "f"]);
+    let took = t.elapsed();
+    assert_eq!(o.status.code(), Some(5), "{}", stderr(&o));
+    assert!(stderr(&o).ends_with("gitfar: repo_warming: warming up\n"));
+    assert!(took < Duration::from_secs(4), "{took:?}");
 }
 
 #[test]

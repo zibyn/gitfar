@@ -378,6 +378,22 @@ async fn expired_branch_ttl_fetches_once_for_concurrent_requests() {
 }
 
 #[tokio::test]
+async fn fetch_makes_head_follow_a_renamed_upstream_default_branch() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let ttl = Duration::from_millis(100);
+    let cache = fx.open_refreshing(2, Path::new("git"), ttl, WAIT);
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    let up = fx.tmp.path().join("up/example.com/acme/x.git");
+    git(&up, &["branch", "-m", "trunk", "main"]);
+    tokio::time::sleep(ttl).await;
+
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    assert_eq!(git(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main\n");
+}
+
+#[tokio::test]
 async fn within_branch_ttl_requests_do_not_fetch() {
     let fx = Fixture::new();
     let url = fx.upstream("x");
@@ -603,6 +619,23 @@ async fn rate_limit_without_retry_after_backs_off_from_the_initial_cooldown() {
     assert!(
         cooling[0].1 > Duration::from_secs(7) && cooling[0].1 <= Duration::from_secs(10),
         "{cooling:?}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_warming_suggests_retrying_when_the_cooldown_ends() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_limited(Duration::from_secs(3600), "");
+    fx.limit("429 30");
+
+    let err = cache.ensure(&url, None, SHORT).await.unwrap_err();
+
+    assert_eq!(err.error.progress.unwrap().state, WarmingState::RateLimited);
+    let left = err.retry_after.unwrap();
+    assert!(
+        left > Duration::from_secs(25) && left <= Duration::from_secs(30),
+        "{left:?}"
     );
 }
 
@@ -841,4 +874,79 @@ async fn full_gc_and_allowlist_cleanup_run_only_inside_the_maintenance_window() 
 
     cache.tick(INSIDE_WINDOW).await;
     assert_eq!(gc_runs(), 1, "gc is daily, not every tick");
+}
+
+#[tokio::test]
+async fn a_repo_evicted_before_the_request_gets_its_read_lock_is_warmed_again() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open(2, &fx.slow_git());
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    // 淘汰 holds the write lock while the request is between `ensure` and its read lock.
+    let evicting = cache.lock(&url).write_owned().await;
+    let request = {
+        let (cache, url) = (cache.clone(), url.clone());
+        tokio::spawn(async move { cache.ensure_locked(&url, None, WAIT).await })
+    };
+    tokio::time::sleep(SHORT).await;
+    std::fs::remove_dir_all(cache.path(&url)).unwrap();
+    drop(evicting);
+
+    let (path, _read) = request.await.unwrap().unwrap();
+    assert!(path.join("HEAD").exists());
+    assert_eq!(fx.clones(), 2);
+}
+
+#[tokio::test]
+async fn removing_a_repo_keeps_one_lock_for_its_url() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let (cache, cfg) = open_with(&fx, Path::new("git"));
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    let held = cache.lock(&url);
+    write_config(&fx, "allowlist = [\"example.com/other\"]", "");
+    cfg.reload().unwrap();
+
+    cache.tick(INSIDE_WINDOW).await;
+
+    assert!(!cache.path(&url).exists());
+    assert!(Arc::ptr_eq(&held, &cache.lock(&url)));
+}
+
+// ---- SIGHUP hot reload (spec §4.1) ----
+
+#[tokio::test]
+async fn reloaded_branch_ttl_applies_to_cached_repos() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let (cache, cfg) = open_with(&fx, &fx.fetch_git());
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    let new = fx.commit("x");
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    assert_eq!(fx.fetches(), 0, "within the default 60 s TTL");
+
+    write_config(&fx, "", "branch_ttl = \"0s\"");
+    cfg.reload().unwrap();
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    assert_eq!(fx.fetches(), 1);
+    assert_eq!(trunk(&repo), new);
+}
+
+#[tokio::test]
+async fn warm_list_entries_added_by_reload_are_warmed() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let (cache, cfg) = open_with(&fx, Path::new("git"));
+    write_config(&fx, &format!("warm_list = [\"{url}\"]"), "");
+    cfg.reload().unwrap();
+
+    cache.refresh_warm_list();
+
+    let deadline = Instant::now() + WAIT;
+    while !cache.path(&url).exists() {
+        assert!(Instant::now() < deadline, "warm_list repo never cloned");
+        tokio::time::sleep(SHORT).await;
+    }
 }

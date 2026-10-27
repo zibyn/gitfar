@@ -341,22 +341,37 @@ async fn byte_cap_pages_and_long_lines_are_cut_to_500_chars() {
 #[tokio::test]
 async fn deadline_returns_an_ordered_prefix_and_resumes() {
     let fx = Fx::with_deadline("0s");
-    // Matches on both sides of a batch boundary; then only after it (the first page prints nothing).
+    // Matches early and late; then only late (the first page prints nothing).
     for pattern in ["f(2|1499) hello|line 3 ", "f1499 hello|line 3 "] {
         let body = json!({ "repo": REPO, "pattern": pattern, "context": 1,
-                           "include": ["big/**", "*.txt"], "exclude": ["long.txt", "huge.txt"] });
+                           "include": ["big/f000*", "big/f149*", "*.txt"],
+                           "exclude": ["long.txt", "huge.txt"] });
         let (_, first) = fx.call(body.clone()).await;
         assert_eq!(first["truncated_reason"], "deadline", "{first}");
         let (text, pages) = fx.all_pages(body).await;
         assert!(pages.len() >= 2);
         let spec = [
-            ":(glob)big/**",
+            ":(glob)big/f000*",
+            ":(glob)big/f149*",
             ":(glob)*.txt",
             ":(exclude)long.txt",
             ":(exclude)huge.txt",
         ];
         assert_eq!(text, fx.git_grep(&["-C", "1", "-e", pattern], &spec));
     }
+}
+
+#[tokio::test]
+async fn deadline_is_checked_per_file_after_the_first() {
+    let fx = Fx::with_deadline("0s");
+    // Past the deadline the 10 MB blob after `a-b` is not scanned on this page.
+    let body = json!({ "repo": REPO, "pattern": "hello", "include": ["a-b", "huge.txt"],
+                       "skip_large": false, "output_mode": "count" });
+    let (_, r) = fx.call(body.clone()).await;
+    assert_eq!(r["text"], "a-b:1\n", "{r}");
+    assert_eq!(r["truncated_reason"], "deadline");
+    let (text, _) = fx.all_pages(body).await;
+    assert_eq!(text, "a-b:1\nhuge.txt:1000000\n");
 }
 
 #[tokio::test]
