@@ -655,26 +655,25 @@ impl RepoCache {
         clone
             .args(["clone", "--bare", "-q", "--", &remote])
             .arg(tmp);
-        let res = {
-            let _slot = slot;
-            let out = run(clone);
-            tokio::pin!(out);
-            loop {
-                tokio::select! {
-                    res = &mut out => break res,
-                    _ = tokio::time::sleep(CLONE_POLL) => {
-                        // Dropping `out` kills the clone (kill_on_drop); the caller removes `tmp`.
-                        // shortcut: git's own children (index-pack) may outlive the kill briefly; kill the
-                        // process group if residue shows up after an abort.
-                        if self.disk_low() {
-                            return Err(GitError::msg("free disk below disk_min_free"));
-                        }
-                        self.evict().await;
+        let out = run(clone);
+        tokio::pin!(out);
+        let res = loop {
+            tokio::select! {
+                res = &mut out => break res,
+                _ = tokio::time::sleep(CLONE_POLL) => {
+                    // Dropping `out` kills the clone (kill_on_drop); the caller removes `tmp`.
+                    // shortcut: git's own children (index-pack) may outlive the kill briefly; kill the
+                    // process group if residue shows up after an abort.
+                    if self.disk_low() {
+                        return Err(GitError::msg("free disk below disk_min_free"));
                     }
+                    self.evict().await;
                 }
             }
         };
+        // Recorded before the slot goes, so a clone waiting for it already sees the host cooling.
         self.record(url, &res);
+        drop(slot);
         res?;
         let mut graph = self.git.command(None);
         graph
