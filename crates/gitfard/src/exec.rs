@@ -1,11 +1,16 @@
 //! 检索执行: the request pipeline shared by HTTP and MCP (spec §1.1 ②–⑧) and its executors (§4.6).
 
+mod blame;
+mod git;
 mod list;
+mod log;
 mod read;
+mod show;
 
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gitfar_proto::{Cursor, ErrorBody, ErrorCode, Params, Primitive, Request, Resume};
 use gix::ObjectId;
@@ -39,7 +44,17 @@ pub async fn run(
     let path = cache.ensure(&url, cred, cfg.cache.warm_wait).await?;
     let resumed = pinned.is_some();
     let rev = pinned.unwrap_or_else(|| rev.unwrap_or("HEAD").to_owned());
-    let attempt = || execute(cache, &url, path.clone(), rev.clone(), job.clone());
+    let deadline = cfg.server.request_deadline;
+    let attempt = || {
+        execute(
+            cache,
+            &url,
+            path.clone(),
+            rev.clone(),
+            job.clone(),
+            deadline,
+        )
+    };
     match attempt().await {
         // Only a fresh rev can be unknown because our mirror is stale; a cursor's SHA was resolved here.
         Err(e) if e.error.code == ErrorCode::RevNotFound && !resumed => {
@@ -57,12 +72,28 @@ async fn execute(
     path: PathBuf,
     rev: String,
     job: Resume,
+    deadline: Duration,
 ) -> Result<serde_json::Value, ErrorBody> {
     let guard = cache.lock(url).read_owned().await;
+    let cache = cache.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
         // shortcut: opens the repo per request (cheap, ~ms); keep a ThreadSafeRepository per cached repo if it shows in profiles.
         let repo = gix::open_opts(&path, gix::open::Options::isolated()).map_err(internal)?;
+        let git = git::Git {
+            cache,
+            dir: path,
+            deadline,
+        };
+        if let Resume::Show {
+            params,
+            byte_offset,
+        } = job
+        {
+            // `show` resolves its own rev: it may be an `a..b` range.
+            return serde_json::to_value(show::run(&repo, &git, params, byte_offset)?)
+                .map_err(internal);
+        }
         let commit = repo
             .rev_parse_single(rev.as_str())
             .ok()
@@ -76,6 +107,12 @@ async fn execute(
             }
             Resume::List { params, skipped } => {
                 serde_json::to_value(list::run(&commit, params, skipped)?)
+            }
+            Resume::Log { params, skipped } => {
+                serde_json::to_value(log::run(&git, commit.id, params, skipped)?)
+            }
+            Resume::Blame { params, next_line } => {
+                serde_json::to_value(blame::run(&commit, &git, params, next_line)?)
             }
             other => {
                 return Err(internal(format!(
