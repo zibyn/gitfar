@@ -106,13 +106,12 @@ impl Fixture {
         branch_ttl: Duration,
         fetch_timeout: Duration,
     ) -> Arc<RepoCache> {
-        let base = format!("file://{}/up/", self.tmp.path().display());
-        Arc::new(
-            RepoCache::open(&self.cache_dir(), concurrency)
-                .unwrap()
-                .with_upstream(&base, git)
-                .with_refresh(branch_ttl, fetch_timeout),
-        )
+        let cache = format!(
+            "clone_concurrency = {concurrency}\nbranch_ttl = \"{}ms\"\nfetch_timeout = \"{}ms\"",
+            branch_ttl.as_millis(),
+            fetch_timeout.as_millis()
+        );
+        open_config(self, git, write_config_with(self, "", &cache, "")).0
     }
 
     /// Pushes a new commit to upstream `name`'s `trunk`; returns its SHA.
@@ -311,8 +310,9 @@ async fn restart_discards_half_finished_clones() {
 #[test]
 fn a_second_process_cannot_open_the_same_cache_dir() {
     let fx = Fixture::new();
-    let _first = RepoCache::open(&fx.cache_dir(), 2).unwrap();
-    assert!(RepoCache::open(&fx.cache_dir(), 2).is_err());
+    let cfg = Arc::new(ConfigHandle::load(write_config(&fx, "", "")).unwrap());
+    let _first = RepoCache::open(cfg.clone()).unwrap();
+    assert!(RepoCache::open(cfg).is_err());
 }
 
 #[tokio::test]
@@ -539,21 +539,29 @@ exec git "$@"
 
 impl Fixture {
     fn open_limited(&self, branch_ttl: Duration, upstream: &str) -> Arc<RepoCache> {
-        let base = format!("file://{}/up/", self.tmp.path().display());
-        let limits: gitfard::config::Upstream = toml::from_str(upstream).unwrap();
-        Arc::new(
-            RepoCache::open(&self.cache_dir(), 2)
-                .unwrap()
-                .with_upstream(&base, &upstream_git(self))
-                .with_refresh(branch_ttl, WAIT)
-                .with_limits(&limits),
-        )
+        let cache = format!(
+            "branch_ttl = \"{}ms\"\nfetch_timeout = \"{}ms\"",
+            branch_ttl.as_millis(),
+            WAIT.as_millis()
+        );
+        let path = write_config_with(self, "", &cache, upstream);
+        open_config(self, &upstream_git(self), path).0
     }
 
     /// `+op` / `-op` lines: each clone or fetch start and end, in order.
     fn ops(&self) -> Vec<String> {
         std::fs::read_to_string(self.tmp.path().join("ops.log"))
             .map_or(vec![], |s| s.lines().map(str::to_owned).collect())
+    }
+
+    /// Most clones and fetches ever running at once, from `ops.log`.
+    fn peak(&self) -> i32 {
+        let (mut running, mut peak) = (0, 0);
+        for op in self.ops() {
+            running += if op.starts_with('+') { 1 } else { -1 };
+            peak = peak.max(running);
+        }
+        peak
     }
 
     fn count(&self, op: &str) -> usize {
@@ -708,13 +716,32 @@ async fn fifth_concurrent_fetch_to_one_host_waits() {
         t.await.unwrap().unwrap();
     }
 
-    let (mut running, mut peak) = (0, 0);
-    for op in fx.ops() {
-        running += if op.starts_with('+') { 1 } else { -1 };
-        peak = peak.max(running);
-    }
     assert_eq!(fx.count("fetch"), 5);
-    assert_eq!(peak, 4, "{:?}", fx.ops());
+    assert_eq!(fx.peak(), 4, "{:?}", fx.ops());
+}
+
+#[tokio::test]
+async fn reloaded_clone_concurrency_applies_to_queued_clones() {
+    let fx = Fixture::new();
+    let urls: Vec<_> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|n| fx.upstream(n))
+        .collect();
+    let path = write_config_with(&fx, "", "clone_concurrency = 1", "");
+    let (cache, cfg) = open_config(&fx, &upstream_git(&fx), path);
+    fx.touch("slow");
+    for url in &urls {
+        cache.ensure(url, None, SHORT).await.unwrap_err();
+    }
+
+    write_config_with(&fx, "", "clone_concurrency = 2", "");
+    cfg.reload().unwrap();
+    for url in &urls {
+        cache.ensure(url, None, WAIT).await.unwrap();
+    }
+
+    assert_eq!(fx.count("clone"), 4);
+    assert_eq!(fx.peak(), 2, "{:?}", fx.ops());
 }
 
 // ---- 淘汰, cache_full, 维护 (spec §4.5) ----
@@ -722,6 +749,11 @@ async fn fifth_concurrent_fetch_to_one_host_waits() {
 /// Writes `<tmp>/gitfard.toml` with the given top-level and `[cache]` keys; `allowlist`
 /// defaults to `example.com/acme`, `disk_budget` to 1 TB and `disk_min_free` to 0.
 fn write_config(fx: &Fixture, top: &str, cache: &str) -> PathBuf {
+    write_config_with(fx, top, cache, "")
+}
+
+/// [`write_config`] plus `[upstream]` keys.
+fn write_config_with(fx: &Fixture, top: &str, cache: &str, upstream: &str) -> PathBuf {
     let path = fx.tmp.path().join("gitfard.toml");
     let mut top = top.to_owned();
     if !top.contains("allowlist") {
@@ -737,19 +769,25 @@ fn write_config(fx: &Fixture, top: &str, cache: &str) -> PathBuf {
     }
     std::fs::write(
         &path,
-        format!("{top}\n[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"/unused\"\n[cache]\n{cache}\n"),
+        format!(
+            "{top}\n[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"{}\"\n[cache]\n{cache}\n[upstream]\n{upstream}\n",
+            fx.cache_dir().display()
+        ),
     )
     .unwrap();
     path
 }
 
 fn open_with(fx: &Fixture, git: &Path) -> (Arc<RepoCache>, Arc<ConfigHandle>) {
-    let cfg = Arc::new(ConfigHandle::load(write_config(fx, "", "")).unwrap());
+    open_config(fx, git, write_config(fx, "", ""))
+}
+
+fn open_config(fx: &Fixture, git: &Path, config: PathBuf) -> (Arc<RepoCache>, Arc<ConfigHandle>) {
+    let cfg = Arc::new(ConfigHandle::load(config).unwrap());
     let base = format!("file://{}/up/", fx.tmp.path().display());
-    let cache = RepoCache::open(&fx.cache_dir(), 2)
+    let cache = RepoCache::open(cfg.clone())
         .unwrap()
-        .with_upstream(&base, git)
-        .with_config(cfg.clone());
+        .with_upstream(&base, git);
     (Arc::new(cache), cfg)
 }
 

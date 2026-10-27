@@ -13,8 +13,9 @@ const GOOD: &str = "sha256:d8ad68507997592ff320792b0431158f1063b40b9bd0d87d8f668
 const OLD: &str = "sha256:a2626cbeb7005a9265ee3722fef10c372079f8e0d843302ff3d1fdf2439913a3";
 
 fn write(path: &Path, tokens: &str) {
+    let cache_dir = path.with_file_name("cache").display().to_string();
     let src = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"/c\"\n[cache]\ndisk_budget = \"1GB\"\n{tokens}"
+        "[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"{cache_dir}\"\n[cache]\ndisk_budget = \"1GB\"\ndisk_min_free = \"0B\"\n{tokens}"
     );
     std::fs::write(path, src).unwrap();
 }
@@ -32,8 +33,7 @@ async fn get(handle: &Arc<ConfigHandle>, uri: &str, auth: Option<&str>) -> (Stat
     if let Some(a) = auth {
         req = req.header("authorization", a);
     }
-    let tmp = tempfile::tempdir().unwrap();
-    let cache = Arc::new(RepoCache::open(tmp.path(), 1).unwrap());
+    let cache = Arc::new(RepoCache::open(handle.clone()).unwrap());
     let resp = gitfard::http::router(handle.clone(), cache)
         .oneshot(req.body(Body::empty()).unwrap())
         .await

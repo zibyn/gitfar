@@ -38,8 +38,9 @@ impl Captured {
     }
 }
 
-fn config(tokens: &str) -> String {
-    format!("[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"/c\"\n[cache]\ndisk_budget = \"1GB\"\n{tokens}")
+fn config(dir: &std::path::Path, tokens: &str) -> String {
+    let cache_dir = dir.join("cache").display().to_string();
+    format!("[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"{cache_dir}\"\n[cache]\ndisk_budget = \"1GB\"\ndisk_min_free = \"0B\"\n{tokens}")
 }
 
 #[tokio::test]
@@ -49,9 +50,9 @@ async fn logs_never_contain_token_or_hash() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gitfard.toml");
     let tokens = format!("[[client_tokens]]\nid = \"ci-bot\"\nhash = \"sha256:{HEX}\"\nexpires_at = \"2020-01-01T00:00:00Z\"\n");
-    std::fs::write(&path, config(&tokens)).unwrap();
+    std::fs::write(&path, config(dir.path(), &tokens)).unwrap();
     let h = Arc::new(ConfigHandle::load(&path).unwrap());
-    let cache = Arc::new(RepoCache::open(&dir.path().join("cache"), 1).unwrap());
+    let cache = Arc::new(RepoCache::open(h.clone()).unwrap());
     for auth in ["Bearer gfr_good", "Bearer gfr_wrong"] {
         let req = Request::get("/v1/whoami").header("authorization", auth);
         gitfard::http::router(h.clone(), cache.clone())
@@ -72,7 +73,7 @@ fn zero_tokens_warns_on_load_and_reload() {
     let _g = logs.install();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gitfard.toml");
-    std::fs::write(&path, config("")).unwrap();
+    std::fs::write(&path, config(dir.path(), "")).unwrap();
     let h = ConfigHandle::load(&path).unwrap();
     // Startup: main calls this once logging is initialised.
     h.current().warn_if_no_client_tokens();
@@ -99,7 +100,7 @@ fn no_warning_when_tokens_exist() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gitfard.toml");
     let tokens = format!("[[client_tokens]]\nid = \"ci-bot\"\nhash = \"sha256:{HEX}\"\n");
-    std::fs::write(&path, config(&tokens)).unwrap();
+    std::fs::write(&path, config(dir.path(), &tokens)).unwrap();
     let h = ConfigHandle::load(&path).unwrap();
     h.current().warn_if_no_client_tokens();
     h.reload().unwrap();

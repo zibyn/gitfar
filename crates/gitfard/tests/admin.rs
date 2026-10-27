@@ -62,12 +62,13 @@ fn fx(extra: &str) -> Fx {
     );
     let up = tmp.path().join("up/example.com/acme/x.git");
     git(&work, &["clone", "-q", "--bare", ".", up.to_str().unwrap()]);
+    let cache_dir = tmp.path().join("cache").display().to_string();
     let cfg = tmp.path().join("gitfard.toml");
     std::fs::write(
         &cfg,
         format!(
             "allowlist = [\"example.com/acme\"]\n\
-             [server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"/c\"\n\
+             [server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"{cache_dir}\"\n\
              [cache]\ndisk_budget = \"1GB\"\n{extra}\n\
              [[client_tokens]]\nid = \"ci-bot\"\nhash = \"sha256:{HEX}\"\n"
         ),
@@ -76,10 +77,9 @@ fn fx(extra: &str) -> Fx {
     let config = Arc::new(ConfigHandle::load(&cfg).unwrap());
     let base = format!("file://{}/up/", tmp.path().display());
     let cache = Arc::new(
-        RepoCache::open(&tmp.path().join("cache"), 1)
+        RepoCache::open(config.clone())
             .unwrap()
-            .with_upstream(&base, Path::new("git"))
-            .with_config(config.clone()),
+            .with_upstream(&base, Path::new("git")),
     );
     Fx {
         _serial: serial,
@@ -329,7 +329,7 @@ fn sigterm_shuts_down() {
 
 #[tokio::test]
 async fn alert_rules_only_use_exported_metrics() {
-    let fx = fx("");
+    let fx = fx("disk_min_free = \"0B\"");
     let families = parse_openmetrics(&fx.admin("/metrics").await.1);
     let rules = include_str!("../../../deploy/alerts.yml");
     let mut used = 0;

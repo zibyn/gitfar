@@ -30,7 +30,8 @@ async fn new_token_entry_authenticates_the_printed_token() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gitfard.toml");
     let src = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"/c\"\n[cache]\ndisk_budget = \"1GB\"\n{}",
+        "[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"{}\"\n[cache]\ndisk_budget = \"1GB\"\ndisk_min_free = \"0B\"\n{}",
+        dir.path().join("cache").display(),
         new.entry
     );
     std::fs::write(&path, src).unwrap();
@@ -41,13 +42,10 @@ async fn new_token_entry_authenticates_the_printed_token() {
         .header("authorization", format!("Bearer {}", new.token))
         .body(Body::empty())
         .unwrap();
-    let resp = gitfard::http::router(
-        h,
-        Arc::new(RepoCache::open(&dir.path().join("cache"), 1).unwrap()),
-    )
-    .oneshot(req)
-    .await
-    .unwrap();
+    let resp = gitfard::http::router(h.clone(), Arc::new(RepoCache::open(h).unwrap()))
+        .oneshot(req)
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(

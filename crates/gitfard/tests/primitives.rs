@@ -108,12 +108,13 @@ impl Fx {
         git(&work, &["clone", "-q", "--bare", ".", up.to_str().unwrap()]);
         git(&work, &["push", "-q", up.to_str().unwrap(), "side"]);
 
+        let cache_dir = tmp.path().join("cache").display().to_string();
         let cfg = tmp.path().join("gitfard.toml");
         std::fs::write(
             &cfg,
             format!(
                 "allowlist = [\"example.com/acme\"]\n\
-                 [server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"/c\"\n[cache]\ndisk_budget = \"1GB\"\n\
+                 [server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"{cache_dir}\"\n[cache]\ndisk_budget = \"1GB\"\ndisk_min_free = \"0B\"\n\
                  [[client_tokens]]\nid = \"all\"\nhash = \"{GLOBAL}\"\n\
                  [[client_tokens]]\nid = \"other\"\nhash = \"{SCOPED}\"\nscope = [\"example.com/other\"]\n"
             ),
@@ -122,7 +123,7 @@ impl Fx {
         let config = Arc::new(ConfigHandle::load(&cfg).unwrap());
         let base = format!("file://{}/up/", tmp.path().display());
         let cache = Arc::new(
-            RepoCache::open(&tmp.path().join("cache"), 2)
+            RepoCache::open(config.clone())
                 .unwrap()
                 .with_upstream(&base, Path::new("git")),
         );

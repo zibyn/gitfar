@@ -154,11 +154,7 @@ async fn metrics(State((_, cache)): St) -> impl IntoResponse {
                 .set(left.map_or(0.0, |d| d.as_secs_f64()));
         }
     }
-    if let Some(d) = tokio::task::spawn_blocking(move || cache.disk())
-        .await
-        .ok()
-        .flatten()
-    {
+    if let Ok(d) = tokio::task::spawn_blocking(move || cache.disk()).await {
         m.disk_used.set(d.used as i64);
         m.disk_budget.set(d.budget as i64);
         m.disk_free.set(d.free as i64);
@@ -196,10 +192,7 @@ async fn status(State((_, cache)): St) -> Json<serde_json::Value> {
         .into_iter()
         .map(|(host, left)| serde_json::json!({"host": host, "remaining_seconds": left.as_secs()}))
         .collect();
-    let disk = tokio::task::spawn_blocking(move || cache.disk())
-        .await
-        .ok()
-        .flatten();
+    let disk = tokio::task::spawn_blocking(move || cache.disk()).await.ok();
     Json(serde_json::json!({"clone_queue": queue, "cooldowns": cooldowns, "disk": disk}))
 }
 

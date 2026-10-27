@@ -104,13 +104,14 @@ impl Fx {
         let up = tmp.path().join("up/example.com/acme/h.git");
         git(&work, &["clone", "-q", "--bare", ".", up.to_str().unwrap()]);
 
+        let cache_dir = tmp.path().join("cache").display().to_string();
         let cfg = tmp.path().join("gitfard.toml");
         std::fs::write(
             &cfg,
             format!(
                 "allowlist = [\"example.com/acme\"]\n\
-                 [server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"/c\"\n{server}\n\
-                 [cache]\ndisk_budget = \"1GB\"\n\
+                 [server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"{cache_dir}\"\n{server}\n\
+                 [cache]\ndisk_budget = \"1GB\"\ndisk_min_free = \"0B\"\n\
                  [[client_tokens]]\nid = \"all\"\nhash = \"{GLOBAL}\"\n"
             ),
         )
@@ -118,7 +119,7 @@ impl Fx {
         let config = Arc::new(ConfigHandle::load(&cfg).unwrap());
         let base = format!("file://{}/up/", tmp.path().display());
         let cache = Arc::new(
-            RepoCache::open(&tmp.path().join("cache"), 2)
+            RepoCache::open(config.clone())
                 .unwrap()
                 .with_upstream(&base, Path::new("git")),
         );
@@ -458,8 +459,11 @@ async fn git_writing_lots_of_stderr_still_completes() {
         .status()
         .unwrap();
     let base = format!("file://{}/up/", fx.tmp.path().display());
+    let src = std::fs::read_to_string(fx.tmp.path().join("gitfard.toml")).unwrap();
+    let cfg = fx.tmp.path().join("gitfard2.toml");
+    std::fs::write(&cfg, src.replace("/cache\"", "/cache2\"")).unwrap();
     fx.cache = Arc::new(
-        RepoCache::open(&fx.tmp.path().join("cache2"), 2)
+        RepoCache::open(Arc::new(ConfigHandle::load(&cfg).unwrap()))
             .unwrap()
             .with_upstream(&base, &chatty),
     );

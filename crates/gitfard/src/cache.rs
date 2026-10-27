@@ -4,7 +4,7 @@
 //! wiped at startup), `repos/<规范 URL>.git` (finished full bare clones, each with a `gitfar-access`
 //! touch file whose mtime is the last access, and a `gitfar-gc` file whose mtime is the last full gc).
 //!
-//! With a config attached, the cache also enforces `disk_budget` (LRU 淘汰), `disk_min_free`
+//! The cache reads its config live (SIGHUP applies) and enforces `disk_budget` (LRU 淘汰), `disk_min_free`
 //! (`cache_full`) and runs the daily maintenance window from [`RepoCache::tick`].
 //!
 //! 上游限速 (§4.5): clones and fetches take a per-host slot; a 429/503 puts the whole host in
@@ -49,18 +49,13 @@ pub struct RepoCache {
     /// Prepended to the 规范 URL to get the clone URL; only tests change it (to `file://…/`).
     base: String,
     git: PathBuf,
-    concurrency: usize,
     next_tmp: AtomicU64,
     state: Mutex<State>,
     locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
-    branch_ttl: Duration,
-    fetch_timeout: Duration,
     fresh: Mutex<HashMap<String, Freshness>>,
-    /// `None` (tests only): no budget, no free-disk floor, no maintenance.
-    config: Option<Arc<ConfigHandle>>,
+    config: Arc<ConfigHandle>,
     /// One 淘汰 pass at a time, so concurrent passes don't each evict for the same overrun.
     evicting: tokio::sync::Mutex<()>,
-    limits: Upstream,
     hosts: Mutex<HashMap<String, Host>>,
 }
 
@@ -105,8 +100,10 @@ struct Job {
 }
 
 impl RepoCache {
-    /// Locks `dir` for this process and discards clones a previous process left half-finished.
-    pub fn open(dir: &Path, clone_concurrency: usize) -> io::Result<RepoCache> {
+    /// Locks `server.cache_dir` for this process and discards clones a previous process left
+    /// half-finished. Reads `[cache]`, `[upstream]`, `warm_list`, `allowlist` and `denylist` live.
+    pub fn open(config: Arc<ConfigHandle>) -> io::Result<RepoCache> {
+        let dir = &config.current().server.cache_dir;
         fs::create_dir_all(dir)?;
         let lock = File::create(dir.join("lock"))?;
         lock.try_lock().map_err(|e| {
@@ -127,33 +124,21 @@ impl RepoCache {
             _lock: lock,
             base: "https://".into(),
             git: "git".into(),
-            concurrency: clone_concurrency.max(1),
             next_tmp: AtomicU64::new(0),
             state: Mutex::default(),
             locks: Mutex::default(),
-            branch_ttl: Duration::from_secs(60),
-            fetch_timeout: Duration::from_secs(5),
             fresh: Mutex::default(),
-            limits: Upstream::default(),
             hosts: Mutex::default(),
-            config: None,
+            config,
             evicting: tokio::sync::Mutex::default(),
         })
-    }
-
-    /// Reads `[cache]`, `[upstream]`, `warm_list`, `allowlist` and `denylist` live, so a SIGHUP reload applies.
-    pub fn with_config(mut self, config: Arc<ConfigHandle>) -> RepoCache {
-        self.config = Some(config);
-        self
     }
 
     /// Periodic housekeeping (main calls it every minute with the local minute of day): 淘汰 down
     /// to budget, resume clones paused for low disk, and inside the maintenance window full gc
     /// of due repos plus removal of repos no longer authorized.
     pub async fn tick(self: &Arc<Self>, now_minute: u16) {
-        let Some(cfg) = self.config() else {
-            return;
-        };
+        let cfg = self.config();
         self.evict().await;
         self.pump(&mut self.state.lock().unwrap());
         if cfg.cache.maintenance_window.contains(now_minute) {
@@ -165,19 +150,6 @@ impl RepoCache {
     pub fn with_upstream(mut self, base: &str, git: &Path) -> RepoCache {
         self.base = base.into();
         self.git = git.into();
-        self
-    }
-
-    /// `branch_ttl` and `fetch_timeout` (defaults 60 s and 5 s) when no config is attached.
-    pub fn with_refresh(mut self, branch_ttl: Duration, fetch_timeout: Duration) -> RepoCache {
-        self.branch_ttl = branch_ttl;
-        self.fetch_timeout = fetch_timeout;
-        self
-    }
-
-    /// `[upstream]` (host concurrency, 冷却 backoff, 负缓存 TTL) when no config is attached.
-    pub fn with_limits(mut self, limits: &Upstream) -> RepoCache {
-        self.limits = limits.clone();
         self
     }
 
@@ -212,9 +184,9 @@ impl RepoCache {
         v
     }
 
-    /// Disk usage against the budget and floor (`None` without a config). Walks the cache dir.
-    pub fn disk(&self) -> Option<DiskStatus> {
-        let cfg = self.config()?;
+    /// Disk usage against the budget and floor. Walks the cache dir.
+    pub fn disk(&self) -> DiskStatus {
+        let cfg = self.config();
         let repos = self.repos();
         let size = |url: &String| dir_size(&self.path(url));
         let used = dir_size(&self.root.join("tmp")) + repos.iter().map(size).sum::<u64>();
@@ -225,7 +197,7 @@ impl RepoCache {
             .sum();
         let free =
             rustix::fs::statvfs(&self.root).map_or(0, |s| s.f_bavail.saturating_mul(s.f_frsize));
-        Some(DiskStatus {
+        DiskStatus {
             used,
             budget: cfg.cache.disk_budget,
             free,
@@ -233,7 +205,7 @@ impl RepoCache {
             cache_full: self.disk_low(),
             warm_list_bytes: warm,
             warm_list_over_budget: warm > cfg.cache.disk_budget,
-        })
+        }
     }
 
     /// The cache dir accepts new files (for `/readyz`).
@@ -258,9 +230,7 @@ impl RepoCache {
     /// 预热列表 upkeep (main calls it at startup and every branch TTL): 预热s entries not cached
     /// yet, e.g. added by a reload, and refreshes the rest in the background.
     pub fn refresh_warm_list(self: &Arc<Self>) {
-        let Some(cfg) = self.config() else {
-            return;
-        };
+        let cfg = self.config();
         for url in &cfg.warm_list {
             let Ok(cred) = authorize(&cfg, None, url) else {
                 continue;
@@ -411,10 +381,7 @@ impl RepoCache {
                 .fetches
                 .get_or_create(&vec![("result", ok.into())])
                 .inc();
-            if self
-                .config()
-                .is_some_and(|c| c.warm_list.iter().any(|w| w == url))
-            {
+            if self.config().warm_list.iter().any(|w| w == url) {
                 let g = METRICS
                     .warm_fetch_failures
                     .get_or_create(&vec![("repo", url.into())]);
@@ -533,7 +500,9 @@ impl RepoCache {
 
     /// Starts queued clones, FIFO, up to the concurrency limit. Paused while disk is low; `tick` resumes.
     fn pump(self: &Arc<Self>, st: &mut State) {
-        while st.running < self.concurrency && !self.disk_low() {
+        // Read each time, so a reloaded clone_concurrency applies to clones already queued.
+        let limit = self.config().cache.clone_concurrency.max(1);
+        while st.running < limit && !self.disk_low() {
             // Clones to a cooling host stay queued; the cooldown's end pumps again.
             let Some(i) = st.queue.iter().position(|j| !self.cooling(host(&j.url))) else {
                 return;
@@ -641,22 +610,16 @@ impl RepoCache {
         }))
     }
 
-    /// `branch_ttl`, live from the config when attached.
     fn branch_ttl(&self) -> Duration {
-        self.config()
-            .map_or(self.branch_ttl, |c| c.cache.branch_ttl)
+        self.config().cache.branch_ttl
     }
 
-    /// `fetch_timeout`, live from the config when attached.
     fn fetch_timeout(&self) -> Duration {
-        self.config()
-            .map_or(self.fetch_timeout, |c| c.cache.fetch_timeout)
+        self.config().cache.fetch_timeout
     }
 
-    /// `[upstream]`, live from the config when attached.
     fn limits(&self) -> Upstream {
-        self.config()
-            .map_or_else(|| self.limits.clone(), |c| c.upstream.clone())
+        self.config().upstream.clone()
     }
 
     fn cooling(&self, host: &str) -> bool {
@@ -774,17 +737,14 @@ impl RepoCache {
         fs::rename(tmp, &dst).map_err(GitError::msg)
     }
 
-    fn config(&self) -> Option<Arc<Config>> {
-        self.config.as_ref().map(|c| c.current())
+    fn config(&self) -> Arc<Config> {
+        self.config.current()
     }
 
     /// Free disk under the cache dir is below `disk_min_free`.
     fn disk_low(&self) -> bool {
-        let Some(cfg) = self.config() else {
-            return false;
-        };
         match rustix::fs::statvfs(&self.root) {
-            Ok(s) => s.f_bavail.saturating_mul(s.f_frsize) < cfg.cache.disk_min_free,
+            Ok(s) => s.f_bavail.saturating_mul(s.f_frsize) < self.config().cache.disk_min_free,
             Err(e) => {
                 tracing::warn!(error = %e, "statvfs failed");
                 false
@@ -813,9 +773,7 @@ impl RepoCache {
 
     /// LRU 淘汰 of whole repos until `repos/` + in-progress clones fit `disk_budget`. 预热列表 repos stay.
     async fn evict(&self) {
-        let Some(cfg) = self.config() else {
-            return;
-        };
+        let cfg = self.config();
         let _one = self.evicting.lock().await;
         let mut repos: Vec<_> = self
             .repos()

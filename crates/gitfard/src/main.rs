@@ -92,8 +92,8 @@ async fn main() -> ExitCode {
         cfg.cache.blob_lru,
         cfg.cache.blob_lru_max_object,
     );
-    let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
-        Ok(c) => Arc::new(c.with_config(handle.clone())),
+    let cache = match RepoCache::open(handle.clone()) {
+        Ok(c) => Arc::new(c),
         Err(e) => {
             eprintln!("gitfard: {e}");
             return ExitCode::FAILURE;
