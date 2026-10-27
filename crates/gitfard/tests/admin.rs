@@ -41,6 +41,11 @@ struct Fx {
 
 /// One `file://` upstream `example.com/acme/x` with one commit; `extra` goes into `[cache]`.
 fn fx(extra: &str) -> Fx {
+    fx_with(extra, "", Path::new("git"))
+}
+
+/// [`fx`] with `[upstream]` keys and the `git` executable clones and fetches run.
+fn fx_with(extra: &str, upstream: &str, git_bin: &Path) -> Fx {
     let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
     let work = tmp.path().join("work");
@@ -70,6 +75,7 @@ fn fx(extra: &str) -> Fx {
             "allowlist = [\"example.com/acme\"]\n\
              [server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"{cache_dir}\"\n\
              [cache]\ndisk_budget = \"1GB\"\n{extra}\n\
+             [upstream]\n{upstream}\n\
              [[client_tokens]]\nid = \"ci-bot\"\nhash = \"sha256:{HEX}\"\n"
         ),
     )
@@ -79,7 +85,7 @@ fn fx(extra: &str) -> Fx {
     let cache = Arc::new(
         RepoCache::open(config.clone())
             .unwrap()
-            .with_upstream(&base, Path::new("git")),
+            .with_upstream(&base, git_bin),
     );
     Fx {
         _serial: serial,
@@ -116,6 +122,133 @@ impl Fx {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&body).unwrap())
     }
+}
+
+impl Fx {
+    /// A second upstream, `example.com/acme/<name>`, copied from `x`.
+    fn upstream(&self, name: &str) -> String {
+        let up = self.tmp.path().join("up/example.com/acme");
+        let dst = up.join(format!("{name}.git"));
+        git(
+            &up,
+            &["clone", "-q", "--bare", "x.git", dst.to_str().unwrap()],
+        );
+        format!("example.com/acme/{name}")
+    }
+
+    /// The value of one `/metrics` sample, 0 if absent.
+    async fn sample(&self, series: &str) -> f64 {
+        let text = self.admin("/metrics").await.1;
+        text.lines()
+            .find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or(0.0)
+    }
+}
+
+/// A `git` wrapper whose clones and fetches each log `<op>` to `ops.log` and take 0.5 s; while
+/// `limited` exists they fail with a 429 the way git reports it under `GIT_TRACE_CURL`.
+struct LimitedGit {
+    dir: TempDir,
+}
+
+impl LimitedGit {
+    fn new() -> LimitedGit {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().display();
+        let path = dir.path().join("git");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+case " $* " in *" fetch "*|*" clone "*)
+  case " $* " in *" fetch "*) echo fetch;; *) echo clone;; esac >> '{d}/ops.log'
+  sleep 0.5
+  if [ -e '{d}/limited' ]; then
+    echo "12:00:00.000000 http.c:756          <= Recv header: HTTP/2 429" >&2
+    echo "fatal: unable to access 'https://example.com/': The requested URL returned error: 429" >&2
+    exit 128
+  fi;;
+esac
+exec git "$@"
+"#
+            ),
+        )
+        .unwrap();
+        Command::new("chmod").arg("+x").arg(&path).status().unwrap();
+        LimitedGit { dir }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.path().join("git")
+    }
+
+    fn limit(&self) {
+        std::fs::write(self.dir.path().join("limited"), "").unwrap();
+    }
+
+    fn count(&self, op: &str) -> usize {
+        std::fs::read_to_string(self.dir.path().join("ops.log"))
+            .map_or(0, |s| s.lines().filter(|l| *l == op).count())
+    }
+}
+
+/// One slot per host and a 2 s 冷却, so the second of two requests waits and then finds it cooling.
+const ONE_SLOT: &str = "host_concurrency = 1\ncooldown_initial = \"2s\"";
+const CLONE_ERRORS: &str = r#"gitfar_clones_total{result="error"}"#;
+const FETCH_ERRORS: &str = r#"gitfar_fetches_total{result="error"}"#;
+
+#[tokio::test]
+async fn a_clone_skipped_for_cooling_is_not_a_failed_clone() {
+    let stub = LimitedGit::new();
+    let fx = fx_with("disk_min_free = \"0B\"", ONE_SLOT, &stub.path());
+    let y = fx.upstream("y");
+    let before = fx.sample(CLONE_ERRORS).await;
+    stub.limit();
+
+    for url in ["example.com/acme/x", &y] {
+        fx.cache
+            .ensure(url, None, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+    }
+    // x's clone gets the 429 after 0.5 s; y, waiting for the one slot, then finds the host cooling.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert_eq!(stub.count("clone"), 1);
+    assert_eq!(fx.sample(CLONE_ERRORS).await - before, 1.0);
+}
+
+#[tokio::test]
+async fn a_fetch_skipped_for_cooling_is_not_a_failed_fetch() {
+    let stub = LimitedGit::new();
+    let fx = fx_with(
+        "disk_min_free = \"0B\"\nbranch_ttl = \"0s\"",
+        ONE_SLOT,
+        &stub.path(),
+    );
+    let urls = ["example.com/acme/x".to_owned(), fx.upstream("y")];
+    for url in &urls {
+        fx.cache
+            .ensure(url, None, Duration::from_secs(20))
+            .await
+            .unwrap();
+    }
+    let (fetches, before) = (stub.count("fetch"), fx.sample(FETCH_ERRORS).await);
+    stub.limit();
+
+    let tasks: Vec<_> = urls
+        .iter()
+        .map(|url| {
+            let (cache, url) = (fx.cache.clone(), url.clone());
+            tokio::spawn(async move { cache.ensure(&url, None, Duration::from_secs(20)).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+
+    assert_eq!(stub.count("fetch") - fetches, 1);
+    assert_eq!(fx.sample(FETCH_ERRORS).await - before, 1.0);
 }
 
 /// Checks OpenMetrics text exposition line by line; returns the declared family names.
