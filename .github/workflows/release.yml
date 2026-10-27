@@ -1,0 +1,17 @@
+# Bare binaries (spec §6.2): a `v*` tag attaches linux x86_64 `gitfard` and `gitfar` to its GitHub release.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p gitfard -p gitfar
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes target/release/gitfard target/release/gitfar
+        env:
+          GH_TOKEN: ${{ github.token }}
