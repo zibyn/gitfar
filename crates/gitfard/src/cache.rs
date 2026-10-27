@@ -23,7 +23,7 @@ use base64::Engine;
 use gitfar_proto::{ErrorBody, ErrorCode, WarmingProgress, WarmingState};
 use rand::RngExt;
 use tokio::process::Command;
-use tokio::sync::{watch, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::timeout_at;
 
 use crate::admin::METRICS;
@@ -291,6 +291,25 @@ impl RepoCache {
         }
         touch(&path.join(TOUCH_FILE));
         Ok(path)
+    }
+
+    /// [`RepoCache::ensure`], then the repo's shared lock, held by the caller while it reads.
+    /// A repo 淘汰'd in between is 预热ed again, within the same `wait`.
+    pub async fn ensure_locked(
+        self: &Arc<Self>,
+        url: &str,
+        cred: Option<&Credential>,
+        wait: Duration,
+    ) -> Result<(PathBuf, OwnedRwLockReadGuard<()>), ErrorBody> {
+        let until = Instant::now() + wait;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let path = self.ensure(url, cred, left).await?;
+            let read = self.lock(url).read_owned().await;
+            if path.exists() {
+                return Ok((path, read));
+            }
+        }
     }
 
     /// Fetches a cached repo whose branch TTL has expired, waiting at most `fetch_timeout` from
@@ -819,10 +838,10 @@ impl RepoCache {
         }
     }
 
-    /// Deletes a cached repo under its write lock and drops its lock entry.
+    /// Deletes a cached repo under its write lock, dropping its lock entry if no one else holds it.
     async fn remove(&self, url: &str) {
         let lock = self.lock(url);
-        let _w = lock.write().await;
+        let w = lock.write().await;
         // Renamed out of `repos/` first, so a half-deleted repo never looks cached.
         let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
         let trash = self.root.join("tmp").join(format!("rm-{n}"));
@@ -830,7 +849,12 @@ impl RepoCache {
         if let Err(e) = res {
             tracing::warn!(url, error = %e, "removing repo failed");
         }
-        self.locks.lock().unwrap().remove(url);
+        drop(w);
+        let mut locks = self.locks.lock().unwrap();
+        // Only the map and `lock` hold it; anyone else (even still waiting) keeps it shared.
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(url);
+        }
     }
 
     /// A hermetic git child. The credential travels as env-injected `http.<prefix>.extraHeader`

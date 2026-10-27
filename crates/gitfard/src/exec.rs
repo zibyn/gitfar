@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use gitfar_proto::{Cursor, ErrorBody, ErrorCode, Params, Primitive, Request, Resume};
 use gix::ObjectId;
+use tokio::sync::OwnedRwLockReadGuard;
 
 use crate::admin::METRICS;
 use crate::authz::{authorize, canonicalize};
@@ -112,39 +113,31 @@ async fn run_logged(
     seen.repo = Some(url.clone());
     let cred = authorize(&cfg, scope, &url)
         .map_err(|code| ErrorBody::new(code, "repository not found"))?;
-    let path = cache.ensure(&url, cred, cfg.cache.warm_wait).await?;
-    let resumed = pinned.is_some();
+    // Only a fresh rev can be unknown because our mirror is stale; a cursor's SHA was resolved here.
+    let mut may_refetch = pinned.is_none();
     let rev = pinned.unwrap_or_else(|| rev.unwrap_or("HEAD").to_owned());
-    let attempt = || {
-        execute(
-            cache,
-            &url,
-            path.clone(),
-            rev.clone(),
-            job.clone(),
-            deadline,
-        )
-    };
-    match attempt().await {
-        // Only a fresh rev can be unknown because our mirror is stale; a cursor's SHA was resolved here.
-        Err(e) if e.error.code == ErrorCode::RevNotFound && !resumed => {
-            cache.refetch_for_unknown_rev(&url, cred).await;
-            attempt().await
+    loop {
+        let (path, guard) = cache.ensure_locked(&url, cred, cfg.cache.warm_wait).await?;
+        let res = execute(guard, cache, path, rev.clone(), job.clone(), deadline).await;
+        match res {
+            Err(e) if e.error.code == ErrorCode::RevNotFound && may_refetch => {
+                may_refetch = false;
+                cache.refetch_for_unknown_rev(&url, cred).await;
+            }
+            res => return res,
         }
-        res => res,
     }
 }
 
-/// Resolves `rev` to a commit and runs `job` on it, under the repo's read lock.
+/// Resolves `rev` to a commit and runs `job` on it, holding the repo's read lock `guard`.
 async fn execute(
+    guard: OwnedRwLockReadGuard<()>,
     cache: &Arc<RepoCache>,
-    url: &str,
     path: PathBuf,
     rev: String,
     job: Resume,
     deadline: Instant,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let guard = cache.lock(url).read_owned().await;
     let cache = cache.clone();
     tokio::task::spawn_blocking(move || {
         let _guard = guard;

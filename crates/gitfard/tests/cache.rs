@@ -858,3 +858,41 @@ async fn full_gc_and_allowlist_cleanup_run_only_inside_the_maintenance_window() 
     cache.tick(INSIDE_WINDOW).await;
     assert_eq!(gc_runs(), 1, "gc is daily, not every tick");
 }
+
+#[tokio::test]
+async fn a_repo_evicted_before_the_request_gets_its_read_lock_is_warmed_again() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open(2, &fx.slow_git());
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    // 淘汰 holds the write lock while the request is between `ensure` and its read lock.
+    let evicting = cache.lock(&url).write_owned().await;
+    let request = {
+        let (cache, url) = (cache.clone(), url.clone());
+        tokio::spawn(async move { cache.ensure_locked(&url, None, WAIT).await })
+    };
+    tokio::time::sleep(SHORT).await;
+    std::fs::remove_dir_all(cache.path(&url)).unwrap();
+    drop(evicting);
+
+    let (path, _read) = request.await.unwrap().unwrap();
+    assert!(path.join("HEAD").exists());
+    assert_eq!(fx.clones(), 2);
+}
+
+#[tokio::test]
+async fn removing_a_repo_keeps_one_lock_for_its_url() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let (cache, cfg) = open_with(&fx, Path::new("git"));
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    let held = cache.lock(&url);
+    write_config(&fx, "allowlist = [\"example.com/other\"]", "");
+    cfg.reload().unwrap();
+
+    cache.tick(INSIDE_WINDOW).await;
+
+    assert!(!cache.path(&url).exists());
+    assert!(Arc::ptr_eq(&held, &cache.lock(&url)));
+}
