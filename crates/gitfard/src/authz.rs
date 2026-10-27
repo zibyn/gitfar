@@ -28,9 +28,9 @@ pub fn canonicalize(raw: &str) -> Result<String, String> {
     // Reject anything that could make the cache key or prefix match disagree with what git fetches.
     let ok_segment = |s: &str| {
         !matches!(s, "" | "." | "..")
-            && !s
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#' | '\\' | '@'))
+            && !s.chars().any(|c| {
+                c.is_whitespace() || c.is_control() || matches!(c, '?' | '#' | '\\' | '@' | '%')
+            })
     };
     if !ok_segment(host) || (!path.is_empty() && !path.split('/').all(ok_segment)) {
         return Err(bad(raw));
