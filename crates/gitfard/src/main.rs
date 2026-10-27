@@ -76,7 +76,9 @@ async fn main() -> ExitCode {
         // shortcut: branch_ttl/fetch_timeout are read once; a SIGHUP reload doesn't change them.
         Ok(c) => Arc::new(
             c.with_refresh(cfg.cache.branch_ttl, cfg.cache.fetch_timeout)
-                .with_config(handle.clone()),
+                .with_config(handle.clone())
+                // shortcut: [upstream] is read once; a SIGHUP reload doesn't change it.
+                .with_limits(&handle.current().upstream),
         ),
         Err(e) => {
             eprintln!("gitfard: {e}");
