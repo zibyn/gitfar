@@ -6,12 +6,12 @@ use gitfar_proto::{
 use gix::revision::plumbing::Spec;
 use gix::ObjectId;
 
-use super::git::{pathspecs, Git};
+use super::git::{pathspecs, Runner};
 use super::{invalid, next, BYTE_CAP};
 
 pub(super) fn run(
     repo: &gix::Repository,
-    git: &Git,
+    git: &Runner,
     mut params: ShowParams,
     byte_offset: u64,
 ) -> Result<ShowResponse, ErrorBody> {

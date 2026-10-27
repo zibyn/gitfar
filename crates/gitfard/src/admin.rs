@@ -199,7 +199,7 @@ async fn status(State((_, cache)): St) -> Json<serde_json::Value> {
 /// Config loaded (it is, or we would not be running), cache dir writable, git runnable.
 /// 冷却 and `cache_full` deliberately don't count (spec §6.3).
 async fn readyz(State((_, cache)): St) -> StatusCode {
-    let git = cache.git(None).arg("--version").output().await;
+    let git = cache.git().command(None).arg("--version").output().await;
     let git_ok = git.is_ok_and(|o| o.status.success());
     if git_ok && cache.writable() {
         StatusCode::OK

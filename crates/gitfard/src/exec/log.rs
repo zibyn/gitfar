@@ -3,13 +3,13 @@
 use gitfar_proto::{ErrorBody, LogParams, LogResponse, NoMeta, Resume, TruncatedReason};
 use gix::ObjectId;
 
-use super::git::{pathspecs, Git};
+use super::git::{pathspecs, Runner};
 use super::{next, BYTE_CAP};
 
 const DEFAULT_COUNT: u32 = 20;
 
 pub(super) fn run(
-    git: &Git,
+    git: &Runner,
     commit: ObjectId,
     params: LogParams,
     skipped: u64,

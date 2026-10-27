@@ -1,4 +1,4 @@
-//! git CLI executor for `log`/`show`/`blame` (spec §4.6): global semaphore, deadline, hermetic env.
+//! git CLI executor for `log`/`show`/`blame` (spec §4.6): global semaphore, deadline, output cap.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -10,7 +10,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
 use super::{internal, invalid};
-use crate::cache::RepoCache;
+use crate::git::Git;
 
 /// git children running at once, across all requests (spec: default = cores).
 pub(super) fn semaphore() -> &'static Semaphore {
@@ -24,16 +24,16 @@ pub(super) fn limit() -> usize {
 
 /// Runs git in one cached repo. Callers pass only resolved 40-hex SHAs as revs and put every
 /// user-supplied path after `--`; pathspecs are literal, so `:(magic)` is just a name.
-pub(super) struct Git {
-    pub cache: Arc<RepoCache>,
+pub(super) struct Runner {
+    pub git: Arc<Git>,
     pub dir: PathBuf,
     pub deadline: Instant,
 }
 
-impl Git {
+impl Runner {
     /// stdout of `git <args>`, reading at most `limit` bytes (then the child is killed).
     pub fn run(&self, args: &[String], limit: usize) -> Result<Vec<u8>, ErrorBody> {
-        let mut cmd = self.cache.git(None);
+        let mut cmd = self.git.command(None);
         cmd.arg("--literal-pathspecs")
             .arg("-C")
             .arg(&self.dir)

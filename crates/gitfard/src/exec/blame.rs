@@ -4,14 +4,14 @@ use gitfar_proto::{
     BlameParams, BlameResponse, ErrorBody, ErrorCode, NoMeta, Resume, TruncatedReason,
 };
 
-use super::git::Git;
+use super::git::Runner;
 use super::{internal, invalid, lookup, next, Node, BYTE_CAP};
 
 const MAX_LINES: u32 = 500;
 
 pub(super) fn run(
     commit: &gix::Commit<'_>,
-    git: &Git,
+    git: &Runner,
     params: BlameParams,
     next_line: u32,
 ) -> Result<BlameResponse, ErrorBody> {

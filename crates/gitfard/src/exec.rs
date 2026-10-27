@@ -138,13 +138,13 @@ async fn execute(
     job: Resume,
     deadline: Instant,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let cache = cache.clone();
+    let git = cache.git().clone();
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
         // shortcut: opens the repo per request (cheap, ~ms); keep a ThreadSafeRepository per cached repo if it shows in profiles.
         let repo = gix::open_opts(&path, gix::open::Options::isolated()).map_err(internal)?;
-        let git = git::Git {
-            cache,
+        let git = git::Runner {
+            git,
             dir: path,
             deadline,
         };

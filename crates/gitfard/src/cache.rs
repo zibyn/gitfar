@@ -14,21 +14,19 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use base64::Engine;
 use gitfar_proto::{ErrorBody, ErrorCode, WarmingProgress, WarmingState};
 use rand::RngExt;
-use tokio::process::Command;
 use tokio::sync::{watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::timeout_at;
 
 use crate::admin::METRICS;
 use crate::authz::authorize;
 use crate::config::{Config, ConfigHandle, Credential, Upstream};
+use crate::git::{run, run_out, Git, GitError, GitFailure};
 
 const TOUCH_FILE: &str = "gitfar-access";
 /// An unresolvable rev triggers a fetch only if the last successful one is older than this (§4.5).
@@ -46,9 +44,7 @@ type Outcome = watch::Receiver<Option<Result<(), ErrorCode>>>;
 pub struct RepoCache {
     root: PathBuf,
     _lock: File,
-    /// Prepended to the 规范 URL to get the clone URL; only tests change it (to `file://…/`).
-    base: String,
-    git: PathBuf,
+    git: Arc<Git>,
     next_tmp: AtomicU64,
     state: Mutex<State>,
     locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
@@ -122,8 +118,7 @@ impl RepoCache {
         Ok(RepoCache {
             root: dir.to_owned(),
             _lock: lock,
-            base: "https://".into(),
-            git: "git".into(),
+            git: Arc::new(Git::new("git", "https://")),
             next_tmp: AtomicU64::new(0),
             state: Mutex::default(),
             locks: Mutex::default(),
@@ -148,9 +143,13 @@ impl RepoCache {
 
     /// Clone from `<base><规范 URL>.git` using the `git` executable at `git` (tests: `file://` fixtures).
     pub fn with_upstream(mut self, base: &str, git: &Path) -> RepoCache {
-        self.base = base.into();
-        self.git = git.into();
+        self.git = Arc::new(Git::new(git, base));
         self
+    }
+
+    /// The hermetic git command builder clones and fetches use.
+    pub fn git(&self) -> &Arc<Git> {
+        &self.git
     }
 
     /// Hosts in 冷却 and the time left, by host (for the admin port).
@@ -358,8 +357,8 @@ impl RepoCache {
             // shortcut: a fetch already waiting for a slot still runs if the host starts cooling
             // meanwhile; re-check after acquiring if bursts after a 429 become a problem.
             let _slot = self.slot(url).await;
-            let remote = format!("{}{url}.git", self.base);
-            let mut fetch = self.git(cred);
+            let remote = self.git.remote(url);
+            let mut fetch = self.git.command(cred);
             fetch.arg("-C").arg(&path).args([
                 "fetch",
                 "-q",
@@ -398,7 +397,7 @@ impl RepoCache {
         };
         if res.is_ok() && count_packs(&path) > MAX_PACKS {
             let _write = lock.write().await;
-            let mut repack = self.git(None);
+            let mut repack = self.git.command(None);
             repack
                 .arg("-C")
                 .arg(&path)
@@ -411,7 +410,9 @@ impl RepoCache {
                 tracing::warn!(url, error = %e, "repack failed");
             }
         }
-        let auth_failed = res.as_ref().is_err_and(|e| is_auth_failure(&e.stderr));
+        let auth_failed = res
+            .as_ref()
+            .is_err_and(|e| e.kind == GitFailure::AuthFailed);
         match &res {
             Ok(()) => tracing::info!(url, "fetched"),
             Err(e) => tracing::warn!(url, error = %e, auth_failed, "fetch failed"),
@@ -432,7 +433,7 @@ impl RepoCache {
     /// Points HEAD at the upstream default branch, which a fetch alone never moves (§4.5).
     /// Best effort: on failure HEAD stays as it was.
     async fn follow_head(&self, repo: &Path, remote: &str, cred: Option<&Credential>) {
-        let mut ls = self.git(cred);
+        let mut ls = self.git.command(cred);
         ls.args(["ls-remote", "--symref", "--", remote, "HEAD"]);
         let out = match run_out(ls).await {
             Ok(out) => out,
@@ -446,7 +447,7 @@ impl RepoCache {
         }) else {
             return;
         };
-        let mut set = self.git(None);
+        let mut set = self.git.command(None);
         set.arg("-C").arg(repo).args(["symbolic-ref", "HEAD", head]);
         if let Err(e) = run(set).await {
             tracing::warn!(remote, head, error = %e, "updating HEAD failed");
@@ -454,7 +455,7 @@ impl RepoCache {
     }
 
     async fn write_commit_graph(&self, repo: &Path) -> Result<(), GitError> {
-        let mut graph = self.git(None);
+        let mut graph = self.git.command(None);
         graph.arg("-C").arg(repo).args([
             "commit-graph",
             "write",
@@ -633,13 +634,14 @@ impl RepoCache {
     /// Feeds a clone or fetch result into the host's 冷却 state: 429/503 starts (or extends) a
     /// cooldown for `Retry-After`, else exponential backoff with jitter; a success resets it.
     fn record(self: &Arc<Self>, url: &str, res: &Result<(), GitError>) {
-        let Err(e) = res else {
-            self.host_state(url, |h| h.strikes = 0);
-            return;
+        let retry_after = match res {
+            Ok(()) => return self.host_state(url, |h| h.strikes = 0),
+            Err(GitError {
+                kind: GitFailure::RateLimited { retry_after },
+                ..
+            }) => *retry_after,
+            Err(_) => return,
         };
-        if !e.rate_limited() {
-            return;
-        }
         let limits = self.limits();
         let until = self.host_state(url, |h| {
             h.strikes += 1;
@@ -648,7 +650,7 @@ impl RepoCache {
                 .saturating_mul(1 << (h.strikes - 1).min(16))
                 .min(limits.cooldown_max)
                 .mul_f64(rand::rng().random_range(0.8..=1.0));
-            let until = Instant::now() + e.retry_after.unwrap_or(backoff);
+            let until = Instant::now() + retry_after.unwrap_or(backoff);
             h.cool_until = h.cool_until.max(Some(until));
             until
         });
@@ -673,22 +675,18 @@ impl RepoCache {
         };
         tracing::warn!(url, error = %e, "clone failed");
         let _ = fs::remove_dir_all(&tmp);
-        Err(if self.disk_low() {
-            Failed::Final(ErrorCode::CacheFull, false)
-        } else if e.rate_limited() {
-            Failed::RateLimited
-        } else if e.not_found() {
-            Failed::Final(ErrorCode::NotFound, true)
-        } else if is_auth_failure(&e.stderr) {
+        if self.disk_low() {
+            return Err(Failed::Final(ErrorCode::CacheFull, false));
+        }
+        Err(match e.kind {
+            GitFailure::RateLimited { .. } => Failed::RateLimited,
+            GitFailure::NotFound => Failed::Final(ErrorCode::NotFound, true),
             // Anonymous: the repo may be private and need a credential (§4.4). GitHub/GitLab
             // answer 401 for missing repos too, so either way it is deterministic.
-            match cred {
-                Some(_) => Failed::Final(ErrorCode::NotFound, true),
-                None => Failed::Final(ErrorCode::UpstreamUnavailable, true),
-            }
-        } else {
+            GitFailure::AuthFailed if cred.is_some() => Failed::Final(ErrorCode::NotFound, true),
+            GitFailure::AuthFailed => Failed::Final(ErrorCode::UpstreamUnavailable, true),
             // Network and other errors: neither negatively cached nor cooled.
-            Failed::Final(ErrorCode::UpstreamUnavailable, false)
+            GitFailure::Other => Failed::Final(ErrorCode::UpstreamUnavailable, false),
         })
     }
 
@@ -698,9 +696,9 @@ impl RepoCache {
         cred: Option<&Credential>,
         tmp: &Path,
     ) -> Result<(), GitError> {
-        let remote = format!("{}{url}.git", self.base);
+        let remote = self.git.remote(url);
         // A bare clone mirrors refs/heads/* and refs/tags/* only, and points HEAD at the upstream default.
-        let mut clone = self.git(cred);
+        let mut clone = self.git.command(cred);
         clone
             .args(["clone", "--bare", "-q", "--", &remote])
             .arg(tmp);
@@ -725,7 +723,7 @@ impl RepoCache {
         };
         self.record(url, &res);
         res?;
-        let mut graph = self.git(None);
+        let mut graph = self.git.command(None);
         graph
             .arg("-C")
             .arg(tmp)
@@ -819,9 +817,9 @@ impl RepoCache {
             }
             let lock = self.lock(&url);
             let _w = lock.write().await;
-            let mut gc = self.git(None);
+            let mut gc = self.git.command(None);
             gc.arg("-C").arg(&path).args(["gc", "-q", "--prune=now"]);
-            let mut graph = self.git(None);
+            let mut graph = self.git.command(None);
             graph.arg("-C").arg(&path).args([
                 "commit-graph",
                 "write",
@@ -860,42 +858,6 @@ impl RepoCache {
             locks.remove(url);
         }
     }
-
-    /// A hermetic git child. The credential travels as env-injected `http.<prefix>.extraHeader`
-    /// (not `-c`, which shows in /proc/*/cmdline), so it never lands in the repo's config.
-    pub(crate) fn git(&self, cred: Option<&Credential>) -> Command {
-        let mut c = Command::new(&self.git);
-        c.env_clear()
-            .envs(std::env::var_os("PATH").map(|p| ("PATH", p)))
-            .env("HOME", "/nonexistent")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C")
-            // Response headers (for Retry-After) on stderr; `run` strips them from errors.
-            .env("GIT_TRACE_CURL", "1")
-            .env("GIT_TRACE_CURL_NO_DATA", "1")
-            .env(
-                "GIT_ALLOW_PROTOCOL",
-                self.base.split_once("://").map_or("https", |(s, _)| s),
-            )
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        if let Some(cred) = cred {
-            let basic = base64::engine::general_purpose::STANDARD
-                .encode(format!("x-access-token:{}", cred.token.expose()));
-            c.env("GIT_CONFIG_COUNT", "1")
-                .env(
-                    "GIT_CONFIG_KEY_0",
-                    format!("http.{}{}/.extraHeader", self.base, cred.prefix),
-                )
-                .env(
-                    "GIT_CONFIG_VALUE_0",
-                    format!("Authorization: Basic {basic}"),
-                );
-        }
-        c
-    }
 }
 
 /// Disk state for `/status` and `/metrics`.
@@ -918,93 +880,9 @@ enum Failed {
     Final(ErrorCode, bool),
 }
 
-/// A failed git child: its stderr without the curl trace, and any `Retry-After` it received.
-#[derive(Debug)]
-struct GitError {
-    stderr: String,
-    retry_after: Option<Duration>,
-}
-
-impl GitError {
-    fn msg(e: impl ToString) -> GitError {
-        GitError {
-            stderr: e.to_string(),
-            retry_after: None,
-        }
-    }
-
-    fn rate_limited(&self) -> bool {
-        ["returned error: 429", "returned error: 503"]
-            .iter()
-            .any(|s| self.stderr.contains(s))
-    }
-
-    fn not_found(&self) -> bool {
-        self.stderr.contains("returned error: 404")
-            || self
-                .stderr
-                .lines()
-                .any(|l| l.starts_with("fatal: repository '") && l.ends_with("' not found"))
-    }
-}
-
-impl std::fmt::Display for GitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.stderr)
-    }
-}
-
-async fn run(c: Command) -> Result<(), GitError> {
-    run_out(c).await.map(drop)
-}
-
-/// Like [`run`], returning stdout.
-async fn run_out(mut c: Command) -> Result<Vec<u8>, GitError> {
-    let out = c.output().await.map_err(GitError::msg)?;
-    if out.status.success() {
-        return Ok(out.stdout);
-    }
-    let raw = String::from_utf8_lossy(&out.stderr);
-    let mut retry_after = None;
-    let mut stderr = Vec::new();
-    for line in raw.lines() {
-        // GIT_TRACE_CURL lines start with an `HH:MM:SS.micros` timestamp; never keep them.
-        let b = line.as_bytes();
-        if b.len() > 8 && b[0].is_ascii_digit() && b[2] == b':' && b[5] == b':' {
-            let header = line.split_once("<= Recv header: ").map(|(_, h)| h);
-            if let Some((name, value)) = header.and_then(|h| h.split_once(':')) {
-                if name.eq_ignore_ascii_case("retry-after") {
-                    // shortcut: delta-seconds only; an HTTP-date falls back to backoff. Upgrade if a host sends dates.
-                    retry_after = value.trim().parse().ok().map(Duration::from_secs);
-                }
-            }
-        } else {
-            stderr.push(line);
-        }
-    }
-    Err(GitError {
-        stderr: stderr.join("\n").trim().to_owned(),
-        retry_after,
-    })
-}
-
 /// The host part of a 规范 URL.
 fn host(url: &str) -> &str {
     url.split('/').next().unwrap_or(url)
-}
-
-/// Authentication failures as git reports them under `LC_ALL=C`; GitHub/GitLab answer a bad
-/// or revoked token with 401, which git turns into a failed username prompt.
-fn is_auth_failure(stderr: &str) -> bool {
-    [
-        "Authentication failed",
-        "could not read Username",
-        "could not read Password",
-        "returned error: 401",
-        "returned error: 403",
-    ]
-    .iter()
-    .any(|s| stderr.contains(s))
 }
 
 fn count_packs(repo: &Path) -> usize {
