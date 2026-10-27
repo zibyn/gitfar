@@ -9,6 +9,8 @@ axum = "0.8"
 base64.workspace = true
 clap = { version = "4", features = ["derive"] }
 gitfar-proto.workspace = true
+gix = { version = "0.90", default-features = false, features = ["max-performance", "revision", "sha1"] }
+globset = "0.4.20"
 hex = "0.4"
 jiff = { version = "0.2", features = ["serde"] }
 rand = "0.10"

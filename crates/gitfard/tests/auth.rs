@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use gitfard::cache::RepoCache;
 use gitfard::config::ConfigHandle;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -31,7 +32,9 @@ async fn get(handle: &Arc<ConfigHandle>, uri: &str, auth: Option<&str>) -> (Stat
     if let Some(a) = auth {
         req = req.header("authorization", a);
     }
-    let resp = gitfard::http::router(handle.clone())
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = Arc::new(RepoCache::open(tmp.path(), 1).unwrap());
+    let resp = gitfard::http::router(handle.clone(), cache)
         .oneshot(req.body(Body::empty()).unwrap())
         .await
         .unwrap();

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::Request;
+use gitfard::cache::RepoCache;
 use gitfard::config::ConfigHandle;
 use tower::ServiceExt;
 
@@ -50,9 +51,10 @@ async fn logs_never_contain_token_or_hash() {
     let tokens = format!("[[client_tokens]]\nid = \"ci-bot\"\nhash = \"sha256:{HEX}\"\nexpires_at = \"2020-01-01T00:00:00Z\"\n");
     std::fs::write(&path, config(&tokens)).unwrap();
     let h = Arc::new(ConfigHandle::load(&path).unwrap());
+    let cache = Arc::new(RepoCache::open(&dir.path().join("cache"), 1).unwrap());
     for auth in ["Bearer gfr_good", "Bearer gfr_wrong"] {
         let req = Request::get("/v1/whoami").header("authorization", auth);
-        gitfard::http::router(h.clone())
+        gitfard::http::router(h.clone(), cache.clone())
             .oneshot(req.body(Body::empty()).unwrap())
             .await
             .unwrap();

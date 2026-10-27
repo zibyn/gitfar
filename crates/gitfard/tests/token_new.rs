@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use gitfard::cache::RepoCache;
 use gitfard::config::ConfigHandle;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -40,7 +41,13 @@ async fn new_token_entry_authenticates_the_printed_token() {
         .header("authorization", format!("Bearer {}", new.token))
         .body(Body::empty())
         .unwrap();
-    let resp = gitfard::http::router(h).oneshot(req).await.unwrap();
+    let resp = gitfard::http::router(
+        h,
+        Arc::new(RepoCache::open(&dir.path().join("cache"), 1).unwrap()),
+    )
+    .oneshot(req)
+    .await
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(

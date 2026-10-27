@@ -71,22 +71,6 @@ async fn main() -> ExitCode {
     tracing::info!("config loaded");
     handle.current().warn_if_no_client_tokens();
 
-    let listen = handle.current().server.listen;
-    let listener = match tokio::net::TcpListener::bind(listen).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(%listen, error = %e, "cannot bind API listener");
-            return ExitCode::FAILURE;
-        }
-    };
-    tracing::info!(%listen, "API listening");
-    let app = gitfard::http::router(handle.clone());
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!(error = %e, "API server stopped");
-        }
-    });
-
     let cfg = handle.current();
     let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
         // shortcut: branch_ttl/fetch_timeout are read once; a SIGHUP reload doesn't change them.
@@ -99,6 +83,22 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let listen = handle.current().server.listen;
+    let listener = match tokio::net::TcpListener::bind(listen).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(%listen, error = %e, "cannot bind API listener");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(%listen, "API listening");
+    let app = gitfard::http::router(handle.clone(), cache.clone());
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = %e, "API server stopped");
+        }
+    });
+
     for url in &cfg.warm_list {
         match authorize(&cfg, None, url) {
             Ok(cred) => cache.preheat(url, cred),
