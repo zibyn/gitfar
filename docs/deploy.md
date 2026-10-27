@@ -23,6 +23,7 @@ cargo build --release -p gitfard -p gitfar   # 产物在 target/release/
 从 `deploy/gitfard.toml` 起步，完整键说明见 spec §4.1。要点：
 
 - `allowlist`：允许检索的规范 URL 前缀。不在其中的仓库一律 `not_found`。
+- `denylist`：在允许列表内排除的规范 URL 前缀，拒绝优先，命中同样返回 `not_found`。例如 `allowlist = ["github.com"]` 配 `denylist = ["github.com/huge-org"]`。
 - `cache_dir` **必须挂持久卷**。它可以重建，但要重新克隆所有仓库，很慢。同一缓存目录只能有一个 `gitfard` 进程（文件锁）。
 - `admin_listen` 不鉴权，只能放在内网或只让 Prometheus 访问。镜像示例写 `0.0.0.0:9090` 是为了容器端口映射，裸机部署请用 `127.0.0.1:9090`。
 - `public_hosts`：MCP 客户端请求的 `Host` 头（走反向代理时是代理转发过来的 Host）。为空时 `/mcp` 只接受 loopback。
@@ -84,7 +85,7 @@ Kubernetes ingress 同理：TLS 在 ingress 终止，后端指向 8080；管理�
 kill -HUP "$(pidof gitfard)"     # 或 docker kill -s HUP gitfard
 ```
 
-重新加载允许列表、仓库凭证、预热列表、客户端访问令牌、TTL、限速参数、磁盘预算、维护窗口、截止时间。监听地址、`cache_dir`、`scan_threads`、`blob_lru`、`public_hosts`、`allowed_origins` 需要重启。新配置校验失败时保留旧配置，并记一条错误日志，所以每次 SIGHUP 后看一眼日志。
+重新加载允许列表、拒绝列表、仓库凭证、预热列表、客户端访问令牌、TTL、限速参数、磁盘预算、维护窗口、截止时间。监听地址、`cache_dir`、`scan_threads`、`blob_lru`、`public_hosts`、`allowed_origins` 需要重启。新配置校验失败时保留旧配置，并记一条错误日志，所以每次 SIGHUP 后看一眼日志。
 
 ## 5. 客户端访问令牌
 

@@ -141,7 +141,7 @@ impl RepoCache {
         })
     }
 
-    /// Reads `[cache]`, `[upstream]`, `warm_list` and `allowlist` live, so a SIGHUP reload applies.
+    /// Reads `[cache]`, `[upstream]`, `warm_list`, `allowlist` and `denylist` live, so a SIGHUP reload applies.
     pub fn with_config(mut self, config: Arc<ConfigHandle>) -> RepoCache {
         self.config = Some(config);
         self
@@ -149,7 +149,7 @@ impl RepoCache {
 
     /// Periodic housekeeping (main calls it every minute with the local minute of day): 淘汰 down
     /// to budget, resume clones paused for low disk, and inside the maintenance window full gc
-    /// of due repos plus removal of repos no longer allowlisted.
+    /// of due repos plus removal of repos no longer authorized.
     pub async fn tick(self: &Arc<Self>, now_minute: u16) {
         let Some(cfg) = self.config() else {
             return;
@@ -846,11 +846,11 @@ impl RepoCache {
         tracing::warn!(total, budget, "warm_list repos alone exceed disk_budget");
     }
 
-    /// Full gc of due repos and removal of repos outside the allowlist (spec §4.5 维护).
+    /// Full gc of due repos and removal of repos no longer authorized (spec §4.5 维护).
     async fn maintain(&self, cfg: &Config) {
         for url in self.repos() {
             if authorize(cfg, None, &url).is_err() {
-                tracing::info!(url, "removing repo no longer in the allowlist");
+                tracing::info!(url, "removing repo no longer authorized");
                 self.remove(&url).await;
                 continue;
             }

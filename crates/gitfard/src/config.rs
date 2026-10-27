@@ -22,6 +22,8 @@ pub struct Config {
     #[serde(default)]
     pub allowlist: Vec<String>,
     #[serde(default)]
+    pub denylist: Vec<String>,
+    #[serde(default)]
     pub warm_list: Vec<String>,
     #[serde(default)]
     pub credentials: Vec<Credential>,
@@ -207,6 +209,7 @@ impl Config {
                 .map_err(|e| err(format!("credentials {:?}: {e}", cred.prefix)))?;
         }
         canonicalize_all(&mut c.allowlist, "allowlist")?;
+        canonicalize_all(&mut c.denylist, "denylist")?;
         canonicalize_all(&mut c.warm_list, "warm_list")?;
         for t in &mut c.client_tokens {
             if let Some(scope) = &mut t.scope {

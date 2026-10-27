@@ -135,7 +135,7 @@ async fn main() -> ExitCode {
 
     for url in &cfg.warm_list {
         if authorize(&cfg, None, url).is_err() {
-            tracing::warn!(url, "warm_list entry outside the allowlist; skipped");
+            tracing::warn!(url, "warm_list entry not authorized; skipped");
         }
     }
     // 预热列表 repos stay fresh in the background; others refresh only when requested.

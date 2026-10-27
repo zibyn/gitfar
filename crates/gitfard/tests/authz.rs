@@ -66,6 +66,27 @@ fn authorize_rejects_outside_allowlist_as_not_found() {
 }
 
 #[test]
+fn authorize_denylist_overrides_allowlist_on_segment_boundaries() {
+    let c = config(&format!(
+        "denylist = [\"https://github.com/acme/secret\"]\n{CREDS}"
+    ))
+    .unwrap();
+    assert_eq!(c.denylist, ["github.com/acme/secret"]);
+    // Denied is indistinguishable from not allowlisted, even with a matching credential.
+    for url in ["github.com/acme/secret", "github.com/acme/secret/x"] {
+        assert_eq!(
+            authorize(&c, None, url).unwrap_err(),
+            ErrorCode::NotFound,
+            "{url}"
+        );
+    }
+    assert_eq!(
+        token_of(authorize(&c, None, "github.com/acme/secretive")),
+        Some("org")
+    );
+}
+
+#[test]
 fn authorize_enforces_token_scope() {
     let c = config(CREDS).unwrap();
     let scope = ["github.com/acme/secret".to_string()];
@@ -120,6 +141,12 @@ fn config_rejects_invalid_or_duplicate_prefixes() {
     ] {
         assert!(config(bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn invalid_denylist_entry_names_the_key() {
+    let e = config("denylist = [\"github.com/a b\"]").unwrap_err();
+    assert!(e.to_string().contains("denylist: "), "{e}");
 }
 
 #[test]

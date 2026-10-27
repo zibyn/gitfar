@@ -5,7 +5,7 @@ use gitfar_proto::ErrorCode;
 use crate::config::{Config, Credential};
 
 /// Normalizes a repo URL or config prefix to `host/path`. A bare host (`github.com`) is valid,
-/// so the same function serves both request URLs and allowlist/scope/credential/warm-list prefixes.
+/// so the same function serves both request URLs and allowlist/denylist/scope/credential/warm-list prefixes.
 pub fn canonicalize(raw: &str) -> Result<String, String> {
     let rest = match raw.split_once("://") {
         Some((_, rest)) => rest,
@@ -61,7 +61,8 @@ pub fn authorize<'c>(
     url: &str,
 ) -> Result<Option<&'c Credential>, ErrorCode> {
     let within = |prefixes: &[String]| prefixes.iter().any(|p| prefix_matches(p, url));
-    if !within(&config.allowlist) || !scope.is_none_or(within) {
+    // Denylist wins over the allowlist and is indistinguishable from not being allowlisted.
+    if !within(&config.allowlist) || within(&config.denylist) || !scope.is_none_or(within) {
         return Err(ErrorCode::NotFound);
     }
     Ok(config

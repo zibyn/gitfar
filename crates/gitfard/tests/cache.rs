@@ -950,3 +950,35 @@ async fn warm_list_entries_added_by_reload_are_warmed() {
         tokio::time::sleep(SHORT).await;
     }
 }
+
+#[tokio::test]
+async fn maintenance_removes_a_repo_denied_after_reload() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let (cache, cfg) = open_with(&fx, Path::new("git"));
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    write_config(&fx, &format!("denylist = [\"{url}\"]"), "");
+    cfg.reload().unwrap();
+
+    cache.tick(INSIDE_WINDOW).await;
+
+    assert!(!cache.path(&url).exists());
+}
+
+#[tokio::test]
+async fn denied_warm_list_entries_are_not_warmed() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let (cache, cfg) = open_with(&fx, Path::new("git"));
+    write_config(
+        &fx,
+        &format!("warm_list = [\"{url}\"]\ndenylist = [\"{url}\"]"),
+        "",
+    );
+    cfg.reload().unwrap();
+
+    cache.refresh_warm_list();
+    tokio::time::sleep(SHORT).await;
+
+    assert!(!cache.path(&url).exists());
+}

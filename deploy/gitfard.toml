@@ -2,6 +2,7 @@
 # Keys marked "restart" need a restart; everything else reloads on SIGHUP.
 
 allowlist = ["github.com/acme"]
+denylist = []                    # prefixes excluded from the allowlist; deny wins
 warm_list = []                   # repos cloned at startup and kept fresh
 
 [server]
