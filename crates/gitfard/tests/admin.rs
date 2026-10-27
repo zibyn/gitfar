@@ -145,29 +145,35 @@ impl Fx {
     }
 }
 
-/// A `git` wrapper whose clones and fetches each log `<op>` to `ops.log` and take 0.5 s; while
-/// `limited` exists they fail with a 429 the way git reports it under `GIT_TRACE_CURL`.
+/// A `git` wrapper whose clones and fetches log `+op` / `-op` at start and end to `ops.log` (as
+/// in `tests/cache.rs`) and take 0.5 s; while `limited` exists they fail with a 429 the way git
+/// reports it under `GIT_TRACE_CURL`.
 struct LimitedGit {
     dir: TempDir,
 }
 
 impl LimitedGit {
     fn new() -> LimitedGit {
-        let dir = TempDir::new().unwrap();
-        let d = dir.path().display();
-        let path = dir.path().join("git");
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().display();
+        let path = tmp.path().join("git");
         std::fs::write(
             &path,
             format!(
                 r#"#!/bin/sh
 case " $* " in *" fetch "*|*" clone "*)
-  case " $* " in *" fetch "*) echo fetch;; *) echo clone;; esac >> '{d}/ops.log'
+  case " $* " in *" fetch "*) op=fetch;; *) op=clone;; esac
+  echo "+$op" >> '{dir}/ops.log'
   sleep 0.5
-  if [ -e '{d}/limited' ]; then
+  if [ -e '{dir}/limited' ]; then
     echo "12:00:00.000000 http.c:756          <= Recv header: HTTP/2 429" >&2
     echo "fatal: unable to access 'https://example.com/': The requested URL returned error: 429" >&2
+    echo "-$op" >> '{dir}/ops.log'
     exit 128
-  fi;;
+  fi
+  git "$@"; rc=$?
+  echo "-$op" >> '{dir}/ops.log'
+  exit $rc;;
 esac
 exec git "$@"
 "#
@@ -175,7 +181,7 @@ exec git "$@"
         )
         .unwrap();
         Command::new("chmod").arg("+x").arg(&path).status().unwrap();
-        LimitedGit { dir }
+        LimitedGit { dir: tmp }
     }
 
     fn path(&self) -> PathBuf {
@@ -186,13 +192,17 @@ exec git "$@"
         std::fs::write(self.dir.path().join("limited"), "").unwrap();
     }
 
+    /// Clones or fetches started (`op` = `clone` / `fetch`).
     fn count(&self, op: &str) -> usize {
+        let start = format!("+{op}");
         std::fs::read_to_string(self.dir.path().join("ops.log"))
-            .map_or(0, |s| s.lines().filter(|l| *l == op).count())
+            .map_or(0, |s| s.lines().filter(|l| *l == start).count())
     }
 }
 
-/// One slot per host and a 2 s 冷却, so the second of two requests waits and then finds it cooling.
+/// The fixture's upstream.
+const X: &str = "example.com/acme/x";
+/// One slot per host and a 2 s cooldown, so the second of two requests waits and then finds it cooling.
 const ONE_SLOT: &str = "host_concurrency = 1\ncooldown_initial = \"2s\"";
 const CLONE_ERRORS: &str = r#"gitfar_clones_total{result="error"}"#;
 const FETCH_ERRORS: &str = r#"gitfar_fetches_total{result="error"}"#;
@@ -205,7 +215,7 @@ async fn a_clone_skipped_for_cooling_is_not_a_failed_clone() {
     let before = fx.sample(CLONE_ERRORS).await;
     stub.limit();
 
-    for url in ["example.com/acme/x", &y] {
+    for url in [X, &y] {
         fx.cache
             .ensure(url, None, Duration::from_millis(100))
             .await
@@ -226,7 +236,7 @@ async fn a_fetch_skipped_for_cooling_is_not_a_failed_fetch() {
         ONE_SLOT,
         &stub.path(),
     );
-    let urls = ["example.com/acme/x".to_owned(), fx.upstream("y")];
+    let urls = [X.to_owned(), fx.upstream("y")];
     for url in &urls {
         fx.cache
             .ensure(url, None, Duration::from_secs(20))
