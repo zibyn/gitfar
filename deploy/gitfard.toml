@@ -1,0 +1,45 @@
+# Example gitfard config (spec §4.1). Copy, edit, then `gitfard serve --config <path>`.
+# Keys marked "restart" need a restart; everything else reloads on SIGHUP.
+
+allowlist = ["github.com/acme"]
+warm_list = []                   # repos cloned at startup and kept fresh
+
+[server]
+listen = "0.0.0.0:8080"          # restart; plain HTTP, terminate TLS in front
+admin_listen = "0.0.0.0:9090"    # restart; unauthenticated, keep it off the public network
+cache_dir = "/var/lib/gitfar"    # restart; must be a persistent volume
+public_hosts = ["gitfar.example.com"]  # restart; Host header MCP clients send (via the proxy)
+allowed_origins = []             # restart; e.g. ["https://gitfar.example.com"]
+scan_threads = 0                 # restart; 0 = number of cores
+request_deadline = "30s"
+log_format = "json"              # json | pretty
+
+[cache]
+disk_budget = "50GB"
+disk_min_free = "5GB"            # below this the cache is full: no new clones
+blob_lru = "auto"                # restart; auto = 1/4 of physical memory
+blob_lru_max_object = "8MB"
+branch_ttl = "60s"
+warm_wait = "20s"
+fetch_timeout = "5s"
+clone_concurrency = 2
+maintenance_window = "03:00-05:00"
+
+[upstream]
+host_concurrency = 4
+cooldown_initial = "30s"
+cooldown_max = "15m"
+negative_cache_ttl = "5m"
+
+# Credential for private repos under a prefix: literal | env:VAR | file:/path
+# [[credentials]]
+# prefix = "github.com/acme"
+# token = "env:GITHUB_ACME_TOKEN"
+
+# Client access tokens: paste the entry printed by `gitfard token new`, then SIGHUP.
+# With none, every request is rejected with 401.
+# [[client_tokens]]
+# id = "alice-laptop"
+# hash = "sha256:<64 hex>"
+# scope = ["github.com/acme"]          # optional; omit for all of the allowlist
+# expires_at = "2027-01-01T00:00:00Z"  # optional

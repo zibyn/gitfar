@@ -326,3 +326,27 @@ fn sigterm_shuts_down() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[tokio::test]
+async fn alert_rules_only_use_exported_metrics() {
+    let fx = fx("");
+    let families = parse_openmetrics(&fx.admin("/metrics").await.1);
+    let rules = include_str!("../../../deploy/alerts.yml");
+    let mut used = 0;
+    for (i, _) in rules.match_indices("gitfar_") {
+        let name: String = rules[i..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let family = name.strip_suffix("_total").unwrap_or(&name);
+        // Labelled families appear only after their first sample, so fall back to the registry.
+        let registered = format!("\"{}\", \"", &family["gitfar_".len()..]);
+        assert!(
+            families.iter().any(|f| f == family)
+                || include_str!("../src/admin.rs").contains(&registered),
+            "{name} is not exported"
+        );
+        used += 1;
+    }
+    assert!(used >= 6, "spec §6.5 lists six alerts");
+}

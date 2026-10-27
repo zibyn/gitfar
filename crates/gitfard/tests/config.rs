@@ -171,3 +171,10 @@ fn secrets_never_appear_in_parse_errors() {
     let shown = format!("{e} {e:?}");
     assert!(!shown.contains("ghp_inline"), "{shown}");
 }
+
+#[test]
+fn shipped_example_config_loads() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/gitfard.toml");
+    let c = Config::load(std::path::Path::new(path)).unwrap();
+    assert_eq!(c.server.cache_dir, std::path::Path::new("/var/lib/gitfar"));
+}

@@ -1,0 +1,50 @@
+# Recommended Prometheus alert rules for gitfard (spec §6.5).
+# Scrape the admin listener's /metrics. Tune thresholds to your deployment.
+groups:
+  - name: gitfar
+    rules:
+      - alert: GitfarCacheFull
+        expr: gitfar_cache_full == 1
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "gitfard cache is full: free disk below disk_min_free, new clones fail with cache_full"
+
+      - alert: GitfarHostCoolingTooLong
+        expr: min_over_time(gitfar_host_cooling[30m]) == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "Upstream {{ $labels.host }} has been in cooldown for over 30 minutes"
+
+      - alert: GitfarWarmListOverBudget
+        expr: gitfar_warm_list_over_budget == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Warm-list repos alone exceed disk_budget; raise the budget or shrink warm_list"
+
+      - alert: GitfarWarmRepoFetchFailing
+        expr: gitfar_warm_repo_consecutive_fetch_failures >= 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Warm-list repo {{ $labels.repo }} failed {{ $value }} fetches in a row"
+
+      - alert: GitfarCloneQueueBacklog
+        expr: gitfar_clone_queue_length > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} clones waiting in the gitfard clone queue"
+
+      - alert: GitfarDiskNearFloor
+        expr: gitfar_disk_free_bytes < 1.2 * gitfar_disk_min_free_bytes and gitfar_cache_full == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Free disk is within 20% of disk_min_free; cache_full is imminent"
