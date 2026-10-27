@@ -176,11 +176,11 @@ struct BlameArgs {
 }
 
 /// A clap-validated enum value into its gitfar-proto type.
-fn en<T: DeserializeOwned>(s: Option<String>) -> Option<T> {
+fn enum_arg<T: DeserializeOwned>(s: Option<String>) -> Option<T> {
     s.map(|s| serde_json::from_value(json!(s)).expect("clap restricted the values"))
 }
 
-fn some(b: bool) -> Option<bool> {
+fn flag(b: bool) -> Option<bool> {
     b.then_some(true)
 }
 
@@ -221,8 +221,8 @@ fn request(cmd: Cmd) -> (Primitive, Value) {
                 path: a.path,
                 include: a.include,
                 exclude: a.exclude,
-                fixed_string: some(a.fixed_string),
-                ignore_case: some(a.ignore_case),
+                fixed_string: flag(a.fixed_string),
+                ignore_case: flag(a.ignore_case),
                 before: a.before,
                 after: a.after,
                 context: a.context,
@@ -246,7 +246,7 @@ fn request(cmd: Cmd) -> (Primitive, Value) {
                 path: a.path,
                 glob: a.glob,
                 max_depth: a.max_depth,
-                r#type: en(a.r#type),
+                r#type: enum_arg(a.r#type),
             }
         ),
         Cmd::Log(a) => body!(
@@ -270,7 +270,7 @@ fn request(cmd: Cmd) -> (Primitive, Value) {
                 repo: a.repo.unwrap(),
                 rev: a.rev.unwrap(),
                 path: a.path,
-                format: en(a.format),
+                format: enum_arg(a.format),
                 context_lines: a.context_lines,
             }
         ),

@@ -36,8 +36,8 @@ pub async fn run(
     body: serde_json::Value,
 ) -> Result<serde_json::Value, ErrorBody> {
     let start = Instant::now();
-    let mut seen = Seen::default();
-    let res = run_logged(config, cache, token, primitive, body, &mut seen).await;
+    let mut log_fields = LogFields::default();
+    let res = run_logged(config, cache, token, primitive, body, &mut log_fields).await;
     let elapsed = start.elapsed();
     let (code, commit, reason) = match &res {
         Ok(v) => (
@@ -72,8 +72,8 @@ pub async fn run(
     // Only the 规范 URL is logged: the raw `repo` could carry userinfo.
     tracing::info!(
         primitive = primitive.name(),
-        repo = seen.repo,
-        rev = seen.rev,
+        repo = log_fields.repo,
+        rev = log_fields.rev,
         resolved_commit = commit,
         elapsed_ms = elapsed.as_millis() as u64,
         truncated_reason = reason,
@@ -86,7 +86,7 @@ pub async fn run(
 
 /// What the request log needs from inside the pipeline.
 #[derive(Default)]
-struct Seen {
+struct LogFields {
     repo: Option<String>,
     rev: Option<String>,
 }
@@ -97,7 +97,7 @@ async fn run_logged(
     token: &TokenCtx,
     primitive: Primitive,
     body: serde_json::Value,
-    seen: &mut Seen,
+    log_fields: &mut LogFields,
 ) -> Result<serde_json::Value, ErrorBody> {
     let scope = token.scope.as_deref();
     // A fresh request is a resume from offset zero; a cursor carries the SHA it is pinned to.
@@ -106,11 +106,11 @@ async fn run_logged(
         Request::Resume(c) => (c.resume, Some(c.resolved_commit)),
     };
     let (repo, rev) = target(&job);
-    seen.rev = rev.map(str::to_owned);
+    log_fields.rev = rev.map(str::to_owned);
     let cfg = config.current();
     let deadline = Instant::now() + cfg.server.request_deadline;
     let url = canonicalize(repo).map_err(|e| ErrorBody::new(ErrorCode::InvalidArgument, e))?;
-    seen.repo = Some(url.clone());
+    log_fields.repo = Some(url.clone());
     let cred = authorize(&cfg, scope, &url)
         .map_err(|code| ErrorBody::new(code, "repository not found"))?;
     // Only a fresh rev can be unknown because our mirror is stale; a cursor's SHA was resolved here.
@@ -180,12 +180,7 @@ async fn execute(
             Resume::Grep { params, path, line } => {
                 serde_json::to_value(grep::run(&commit, params, (path, line), deadline)?)
             }
-            other => {
-                return Err(internal(format!(
-                    "{} is not implemented",
-                    other.primitive().name()
-                )))
-            }
+            Resume::Show { .. } => unreachable!("show returned above"),
         };
         value.map_err(internal)
     })
@@ -241,7 +236,7 @@ fn target(job: &Resume) -> (&str, Option<&str>) {
     }
 }
 
-/// The `next` token resuming `resume` on `commit`.
+/// The `next` cursor resuming `resume` on `commit`.
 fn next(commit: ObjectId, resume: Resume) -> Option<String> {
     Some(
         Cursor {
