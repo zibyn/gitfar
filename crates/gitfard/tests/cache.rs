@@ -721,6 +721,69 @@ async fn fifth_concurrent_fetch_to_one_host_waits() {
 }
 
 #[tokio::test]
+async fn a_fetch_waiting_for_a_slot_is_skipped_once_the_host_cools() {
+    let fx = Fixture::new();
+    let [a, b] = ["a", "b"].map(|n| fx.upstream(n));
+    let cache = fx.open_limited(
+        Duration::ZERO,
+        "host_concurrency = 1\ncooldown_initial = \"2s\"",
+    );
+    for url in [&a, &b] {
+        cache.ensure(url, None, WAIT).await.unwrap();
+    }
+    std::fs::remove_file(fx.tmp.path().join("ops.log")).unwrap();
+    fx.touch("slow");
+    fx.limit("429");
+
+    let tasks: Vec<_> = [&a, &b]
+        .map(|url| {
+            let (cache, url) = (cache.clone(), url.clone());
+            tokio::spawn(async move { cache.ensure(&url, None, WAIT).await })
+        })
+        .into_iter()
+        .collect();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+
+    assert_eq!(fx.count("fetch"), 1, "{:?}", fx.ops());
+    // One strike only: a second 429 would have doubled the backoff past 2 s.
+    let cooling = cache.cooldowns();
+    assert!(cooling[0].1 <= Duration::from_secs(2), "{cooling:?}");
+
+    fx.unlimit();
+    tokio::time::sleep(cooling[0].1).await;
+    cache.ensure(&b, None, WAIT).await.unwrap();
+    assert_eq!(fx.count("fetch"), 2);
+}
+
+#[tokio::test]
+async fn a_clone_waiting_for_a_slot_stays_queued_once_the_host_cools() {
+    let fx = Fixture::new();
+    let [a, b] = ["a", "b"].map(|n| fx.upstream(n));
+    let cache = fx.open_limited(
+        Duration::from_secs(3600),
+        "host_concurrency = 1\ncooldown_initial = \"2s\"",
+    );
+    fx.touch("slow");
+    fx.limit("429");
+
+    for url in [&a, &b] {
+        cache.ensure(url, None, SHORT).await.unwrap_err();
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(fx.count("clone"), 1, "{:?}", fx.ops());
+    let cooling = cache.cooldowns();
+    assert!(cooling[0].1 <= Duration::from_secs(2), "{cooling:?}");
+
+    fx.unlimit();
+    for url in [&a, &b] {
+        cache.ensure(url, None, WAIT).await.unwrap();
+    }
+    assert_eq!(fx.count("clone"), 3);
+}
+
+#[tokio::test]
 async fn reloaded_clone_concurrency_applies_to_queued_clones() {
     let fx = Fixture::new();
     let urls: Vec<_> = ["a", "b", "c", "d"]

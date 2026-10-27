@@ -335,9 +335,12 @@ impl RepoCache {
         let lock = self.lock(url);
         let res = {
             let _read = lock.read().await;
-            // shortcut: a fetch already waiting for a slot still runs if the host starts cooling
-            // meanwhile; re-check after acquiring if bursts after a 429 become a problem.
             let _slot = self.upstream.slot(host(url)).await;
+            // The host may have started cooling while we waited. Skipped, not failed: the first
+            // request after the cooldown fetches as usual.
+            if self.upstream.cooling(host(url), Instant::now()) {
+                return self.fresh_state(url, |f| f.running = None);
+            }
             let remote = self.git.remote(url);
             let mut fetch = self.git.command(cred);
             fetch.arg("-C").arg(&path).args([
@@ -645,6 +648,13 @@ impl RepoCache {
             .arg(tmp);
         let res = {
             let _slot = self.upstream.slot(host(url)).await;
+            // Cooling began while we waited: back to the queue without asking upstream (or a strike).
+            if self.upstream.cooling(host(url), Instant::now()) {
+                return Err(GitError {
+                    stderr: "upstream host cooling".into(),
+                    kind: GitFailure::RateLimited { retry_after: None },
+                });
+            }
             let out = run(clone);
             tokio::pin!(out);
             loop {
