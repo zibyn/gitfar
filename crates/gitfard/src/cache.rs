@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use gitfar_proto::{ErrorBody, ErrorCode, WarmingProgress, WarmingState};
-use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock};
 use tokio::time::timeout_at;
 
 use crate::admin::METRICS;
@@ -506,17 +506,19 @@ impl RepoCache {
             let this = self.clone();
             tokio::spawn(async move {
                 let res = this.clone_repo(&job.url, job.cred.as_ref()).await;
-                let ok = if res.is_ok() { "ok" } else { "error" };
-                METRICS
-                    .clones
-                    .get_or_create(&vec![("result", ok.into())])
-                    .inc();
+                if !matches!(res, Err(Failed::Cooling)) {
+                    let ok = if res.is_ok() { "ok" } else { "error" };
+                    METRICS
+                        .clones
+                        .get_or_create(&vec![("result", ok.into())])
+                        .inc();
+                }
                 let res = match res {
                     Ok(()) => {
                         tracing::info!(url = job.url, "cloned");
                         Ok(())
                     }
-                    Err(Failed::RateLimited) => {
+                    Err(Failed::RateLimited | Failed::Cooling) => {
                         let mut st = this.state.lock().unwrap();
                         st.running -= 1;
                         st.queue.push_front(job);
@@ -612,9 +614,14 @@ impl RepoCache {
         url: &str,
         cred: Option<&Credential>,
     ) -> Result<(), Failed> {
+        let slot = self.upstream.slot(host(url)).await;
+        // Cooling began while we waited: back to the queue without asking upstream (or a strike).
+        if self.upstream.cooling(host(url), Instant::now()) {
+            return Err(Failed::Cooling);
+        }
         let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
         let tmp = self.root.join("tmp").join(n.to_string());
-        let Err(e) = self.clone_into(url, cred, &tmp).await else {
+        let Err(e) = self.clone_into(url, cred, &tmp, slot).await else {
             return Ok(());
         };
         tracing::warn!(url, error = %e, "clone failed");
@@ -634,11 +641,13 @@ impl RepoCache {
         })
     }
 
+    /// Clones into `tmp`, holding the host `slot` until git's clone itself ends.
     async fn clone_into(
         self: &Arc<Self>,
         url: &str,
         cred: Option<&Credential>,
         tmp: &Path,
+        slot: OwnedSemaphorePermit,
     ) -> Result<(), GitError> {
         let remote = self.git.remote(url);
         // A bare clone mirrors refs/heads/* and refs/tags/* only, and points HEAD at the upstream default.
@@ -647,14 +656,7 @@ impl RepoCache {
             .args(["clone", "--bare", "-q", "--", &remote])
             .arg(tmp);
         let res = {
-            let _slot = self.upstream.slot(host(url)).await;
-            // Cooling began while we waited: back to the queue without asking upstream (or a strike).
-            if self.upstream.cooling(host(url), Instant::now()) {
-                return Err(GitError {
-                    stderr: "upstream host cooling".into(),
-                    kind: GitFailure::RateLimited { retry_after: None },
-                });
-            }
+            let _slot = slot;
             let out = run(clone);
             tokio::pin!(out);
             loop {
@@ -827,6 +829,8 @@ pub struct DiskStatus {
 enum Failed {
     /// Back in the queue until the host's 冷却 ends.
     RateLimited,
+    /// Never started (the host began 冷却 while it waited for a slot); back in the queue, uncounted.
+    Cooling,
     /// Reported to waiters; `true` = negatively cached.
     Final(ErrorCode, bool),
 }

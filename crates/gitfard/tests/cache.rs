@@ -771,6 +771,7 @@ async fn a_clone_waiting_for_a_slot_stays_queued_once_the_host_cools() {
     for url in [&a, &b] {
         cache.ensure(url, None, SHORT).await.unwrap_err();
     }
+    // a's clone takes 0.5 s and gets the 429; b has had its slot well before this.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(fx.count("clone"), 1, "{:?}", fx.ops());
     let cooling = cache.cooldowns();
@@ -780,6 +781,7 @@ async fn a_clone_waiting_for_a_slot_stays_queued_once_the_host_cools() {
     for url in [&a, &b] {
         cache.ensure(url, None, WAIT).await.unwrap();
     }
+    // a's 429, then a and b after the cooldown; b's skipped attempt never reached upstream.
     assert_eq!(fx.count("clone"), 3);
 }
 
