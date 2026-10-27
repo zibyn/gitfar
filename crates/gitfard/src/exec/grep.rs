@@ -25,7 +25,7 @@ use crate::admin::METRICS;
 const DEFAULT_RESULTS: u32 = 100;
 const LARGE: u64 = 10_000_000;
 const LINE_CHARS: usize = 500;
-/// Files per parallel batch; limits, the byte cap and the deadline are checked between batches.
+/// Files per parallel batch; limits and the byte cap are checked between batches, the deadline per file.
 const CHUNK: usize = 1024;
 const NOTHING_YET: u32 = u32::MAX - 1;
 
@@ -111,6 +111,8 @@ struct Entry {
 }
 
 enum Scanned {
+    /// Not scanned: the deadline had passed.
+    Cut,
     Large,
     Entries(Vec<Entry>),
 }
@@ -180,7 +182,12 @@ pub(super) fn run(
         .collect();
     // Bytewise full-path order is git's tree order.
     files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    let start = files.partition_point(|f| f.path < after.0);
+    // A cursor ending on a whole file (deadline cut, files/count entry) starts after it.
+    let start = if after.1 >= NOTHING_YET {
+        files.partition_point(|f| f.path <= after.0)
+    } else {
+        files.partition_point(|f| f.path < after.0)
+    };
 
     let engine = engine();
     let sync = commit.repo.clone().into_sync();
@@ -197,14 +204,19 @@ pub(super) fn run(
     let mut printed = !fresh && after.1 != NOTHING_YET;
     let (mut matches, mut emitted) = (0u32, 0usize);
     let mut last = after.clone();
-    let chunks: Vec<&[File]> = files[start..].chunks(CHUNK).collect();
-    'chunks: for (i, chunk) in chunks.iter().enumerate() {
+    let first = files.get(start).map(|f| f.path.as_str());
+    let mut prev: Option<&str> = None;
+    'chunks: for chunk in files[start..].chunks(CHUNK) {
         let scanned: Vec<Result<Scanned, ErrorBody>> = engine.pool.install(|| {
             chunk
                 .par_iter()
                 .map_init(
                     || (sync.to_thread_local(), builder.build()),
                     |(repo, searcher), f| {
+                        // The page's first file always completes, so every page makes progress.
+                        if Some(f.path.as_str()) != first && Instant::now() >= deadline {
+                            return Ok(Scanned::Cut);
+                        }
                         let how = How {
                             matcher: &matcher,
                             mode,
@@ -221,7 +233,14 @@ pub(super) fn run(
         });
         for (f, s) in chunk.iter().zip(scanned) {
             let entries = match s? {
+                Scanned::Cut => {
+                    resp.truncated_reason = Some(TruncatedReason::Deadline);
+                    let done = prev.expect("the first file is never cut").to_owned();
+                    last = (done, if printed { u32::MAX } else { NOTHING_YET });
+                    break 'chunks;
+                }
                 Scanned::Large => {
+                    prev = Some(&f.path);
                     if f.path != after.0 {
                         resp.meta.skipped_large.push(f.path.clone());
                     }
@@ -249,13 +268,7 @@ pub(super) fn run(
                 emitted += 1;
                 matches += u32::from(e.is_match);
             }
-        }
-        // The first batch always completes, so every page makes progress.
-        if i + 1 < chunks.len() && Instant::now() >= deadline {
-            resp.truncated_reason = Some(TruncatedReason::Deadline);
-            let done = chunk.last().expect("chunks are non-empty").path.clone();
-            last = (done, if printed { u32::MAX } else { NOTHING_YET });
-            break;
+            prev = Some(&f.path);
         }
     }
     if resp.truncated_reason.is_some() {
