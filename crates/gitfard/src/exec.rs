@@ -4,6 +4,7 @@ mod list;
 mod read;
 
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gitfar_proto::{Cursor, ErrorBody, ErrorCode, Params, Primitive, Request, Resume};
@@ -36,8 +37,28 @@ pub async fn run(
     let cred = authorize(&cfg, scope, &url)
         .map_err(|code| ErrorBody::new(code, "repository not found"))?;
     let path = cache.ensure(&url, cred, cfg.cache.warm_wait).await?;
-    let guard = cache.lock(&url).read_owned().await;
+    let resumed = pinned.is_some();
     let rev = pinned.unwrap_or_else(|| rev.unwrap_or("HEAD").to_owned());
+    let attempt = || execute(cache, &url, path.clone(), rev.clone(), job.clone());
+    match attempt().await {
+        // Only a fresh rev can be unknown because our mirror is stale; a cursor's SHA was resolved here.
+        Err(e) if e.error.code == ErrorCode::RevNotFound && !resumed => {
+            cache.refetch_for_unknown_rev(&url, cred).await;
+            attempt().await
+        }
+        res => res,
+    }
+}
+
+/// Resolves `rev` to a commit and runs `job` on it, under the repo's read lock.
+async fn execute(
+    cache: &Arc<RepoCache>,
+    url: &str,
+    path: PathBuf,
+    rev: String,
+    job: Resume,
+) -> Result<serde_json::Value, ErrorBody> {
+    let guard = cache.lock(url).read_owned().await;
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
         // shortcut: opens the repo per request (cheap, ~ms); keep a ThreadSafeRepository per cached repo if it shows in profiles.

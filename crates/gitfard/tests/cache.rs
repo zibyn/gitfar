@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gitfar_proto::{ErrorCode, WarmingState};
 use gitfard::cache::RepoCache;
@@ -91,13 +91,106 @@ impl Fixture {
     }
 
     fn open(&self, concurrency: usize, git: &Path) -> Arc<RepoCache> {
+        self.open_refreshing(
+            concurrency,
+            git,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+    }
+
+    fn open_refreshing(
+        &self,
+        concurrency: usize,
+        git: &Path,
+        branch_ttl: Duration,
+        fetch_timeout: Duration,
+    ) -> Arc<RepoCache> {
         let base = format!("file://{}/up/", self.tmp.path().display());
         Arc::new(
             RepoCache::open(&self.cache_dir(), concurrency)
                 .unwrap()
-                .with_upstream(&base, git),
+                .with_upstream(&base, git)
+                .with_refresh(branch_ttl, fetch_timeout),
         )
     }
+
+    /// Pushes a new commit to upstream `name`'s `trunk`; returns its SHA.
+    fn commit(&self, name: &str) -> String {
+        let work = self.tmp.path().join("work").join(name);
+        let n = git(&work, &["rev-list", "--count", "HEAD"]);
+        std::fs::write(work.join("a.txt"), n).unwrap();
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qam",
+                "more",
+            ],
+        );
+        let dst = self
+            .tmp
+            .path()
+            .join(format!("up/example.com/acme/{name}.git"));
+        git(&work, &["push", "-q", dst.to_str().unwrap(), "trunk"]);
+        git(&work, &["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
+    /// A `git` wrapper that logs every fetch. Touching `hang` makes fetches hang; touching
+    /// `revoked` makes them fail the way a rejected credential does.
+    fn fetch_git(&self) -> PathBuf {
+        let path = self.tmp.path().join("fetch-git");
+        let dir = self.tmp.path().display();
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+case " $* " in *" fetch "*)
+  echo x >> '{dir}/fetches.log'
+  [ -e '{dir}/hang' ] && sleep 30
+  [ -e '{dir}/revoked' ] && {{ echo "fatal: Authentication failed for 'https://example.com/'" >&2; exit 128; }}
+  sleep 0.3;;
+esac
+exec git "$@"
+"#
+            ),
+        )
+        .unwrap();
+        Command::new("chmod").arg("+x").arg(&path).status().unwrap();
+        path
+    }
+
+    fn fetches(&self) -> usize {
+        std::fs::read_to_string(self.tmp.path().join("fetches.log"))
+            .map_or(0, |s| s.lines().count())
+    }
+
+    fn touch(&self, name: &str) {
+        std::fs::write(self.tmp.path().join(name), "").unwrap();
+    }
+}
+
+fn trunk(repo: &Path) -> String {
+    git(repo, &["rev-parse", "refs/heads/trunk"])
+        .trim()
+        .to_owned()
+}
+
+fn packs(repo: &Path) -> usize {
+    std::fs::read_dir(repo.join("objects/pack"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "pack")
+        })
+        .count()
 }
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -258,4 +351,130 @@ async fn clone_with_a_credential_leaves_no_secret_in_repo_config() {
         !config.to_ascii_lowercase().contains("extraheader"),
         "{config}"
     );
+}
+
+#[tokio::test]
+async fn expired_branch_ttl_fetches_once_for_concurrent_requests() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let ttl = Duration::from_millis(300);
+    let cache = fx.open_refreshing(2, &fx.fetch_git(), ttl, WAIT);
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    let new = fx.commit("x");
+    tokio::time::sleep(ttl).await;
+
+    let tasks: Vec<_> = (0..5)
+        .map(|_| {
+            let (cache, url) = (cache.clone(), url.clone());
+            tokio::spawn(async move { cache.ensure(&url, None, WAIT).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+
+    assert_eq!(fx.fetches(), 1);
+    assert_eq!(trunk(&repo), new);
+}
+
+#[tokio::test]
+async fn within_branch_ttl_requests_do_not_fetch() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_refreshing(2, &fx.fetch_git(), Duration::from_secs(3600), WAIT);
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    let old = trunk(&repo);
+    fx.commit("x");
+
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    assert_eq!(fx.fetches(), 0);
+    assert_eq!(trunk(&repo), old);
+}
+
+#[tokio::test]
+async fn unreachable_upstream_answers_from_the_old_sha_after_the_fetch_timeout() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let timeout = Duration::from_millis(800);
+    let cache = fx.open_refreshing(2, &fx.fetch_git(), Duration::ZERO, timeout);
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    let old = trunk(&repo);
+    fx.commit("x");
+    fx.touch("hang");
+    let before = fx.fetches();
+
+    let start = Instant::now();
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    let took = start.elapsed();
+
+    assert!(took >= timeout && took < timeout * 3, "{took:?}");
+    assert_eq!(trunk(&repo), old);
+    // The fetch carries on in the background; requests meanwhile join it without waiting again.
+    let start = Instant::now();
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    assert!(start.elapsed() < timeout / 2);
+    assert_eq!(fx.fetches() - before, 1);
+}
+
+#[tokio::test]
+async fn revoked_credential_makes_the_repo_unavailable_until_a_fetch_succeeds() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_refreshing(2, &fx.fetch_git(), Duration::ZERO, WAIT);
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    fx.touch("revoked");
+
+    for _ in 0..2 {
+        let err = cache.ensure(&url, None, WAIT).await.unwrap_err();
+        assert_eq!(err.error.code, ErrorCode::UpstreamUnavailable);
+    }
+
+    std::fs::remove_file(fx.tmp.path().join("revoked")).unwrap();
+    cache.ensure(&url, None, WAIT).await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_rev_refetches_unless_fetched_within_a_minute() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let ttl = Duration::from_secs(3600);
+    let cache = fx.open_refreshing(2, &fx.fetch_git(), ttl, WAIT);
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    fx.commit("x");
+
+    cache.refetch_for_unknown_rev(&url, None).await;
+    assert_eq!(fx.fetches(), 0, "just cloned");
+
+    // After a restart the last fetch time is unknown, so a fetch is due.
+    drop(cache);
+    let cache = fx.open_refreshing(2, &fx.fetch_git(), ttl, WAIT);
+    let new = fx.commit("x");
+    cache.refetch_for_unknown_rev(&url, None).await;
+    cache.refetch_for_unknown_rev(&url, None).await;
+    assert_eq!(fx.fetches(), 1);
+    assert_eq!(trunk(&cache.path(&url)), new);
+}
+
+#[tokio::test]
+async fn fetch_repacks_when_there_are_more_than_16_packs() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open_refreshing(2, Path::new("git"), Duration::ZERO, WAIT);
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+    for i in 0..17 {
+        std::fs::write(repo.join("blob"), format!("blob {i}\n")).unwrap();
+        let sha = git(&repo, &["hash-object", "-w", "blob"]);
+        // Plain repack packs only reachable loose objects.
+        git(
+            &repo,
+            &["update-ref", &format!("refs/tags/b{i}"), sha.trim()],
+        );
+        git(&repo, &["repack", "-q"]);
+    }
+    assert!(packs(&repo) > 16);
+
+    cache.ensure(&url, None, WAIT).await.unwrap();
+
+    assert!(packs(&repo) <= 2, "{} packs", packs(&repo));
 }

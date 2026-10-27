@@ -73,7 +73,8 @@ async fn main() -> ExitCode {
 
     let cfg = handle.current();
     let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
-        Ok(c) => Arc::new(c),
+        // shortcut: branch_ttl/fetch_timeout are read once; a SIGHUP reload doesn't change them.
+        Ok(c) => Arc::new(c.with_refresh(cfg.cache.branch_ttl, cfg.cache.fetch_timeout)),
         Err(e) => {
             eprintln!("gitfard: {e}");
             return ExitCode::FAILURE;
@@ -101,6 +102,22 @@ async fn main() -> ExitCode {
             Err(_) => tracing::warn!(url, "warm_list entry outside the allowlist; skipped"),
         }
     }
+    // 预热列表 repos stay fresh in the background; others refresh only when requested.
+    let (bg, ttl) = (cache.clone(), cfg.cache.branch_ttl);
+    let bg_config = handle.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(ttl);
+        loop {
+            tick.tick().await;
+            let cfg = bg_config.current();
+            for url in &cfg.warm_list {
+                if let Ok(cred) = authorize(&cfg, None, url) {
+                    let (cache, url, cred) = (bg.clone(), url.clone(), cred.cloned());
+                    tokio::spawn(async move { cache.refresh(&url, cred.as_ref()).await });
+                }
+            }
+        }
+    });
 
     let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");

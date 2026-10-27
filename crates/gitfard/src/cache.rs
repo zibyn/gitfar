@@ -11,16 +11,21 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use gitfar_proto::{ErrorBody, ErrorCode, WarmingProgress, WarmingState};
 use tokio::process::Command;
 use tokio::sync::{watch, RwLock};
+use tokio::time::timeout_at;
 
 use crate::config::Credential;
 
 const TOUCH_FILE: &str = "gitfar-access";
+/// An unresolvable rev triggers a fetch only if the last successful one is older than this (§4.5).
+const REV_REFETCH_AFTER: Duration = Duration::from_secs(60);
+/// More packs than this after a fetch triggers a geometric repack (§4.5 维护).
+const MAX_PACKS: usize = 16;
 
 type Outcome = watch::Receiver<Option<Result<(), ErrorCode>>>;
 
@@ -34,6 +39,22 @@ pub struct RepoCache {
     next_tmp: AtomicU64,
     state: Mutex<State>,
     locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
+    branch_ttl: Duration,
+    fetch_timeout: Duration,
+    fresh: Mutex<HashMap<String, Freshness>>,
+}
+
+/// Per-repo refresh state; in memory only, so after a restart the first request fetches.
+#[derive(Default)]
+struct Freshness {
+    /// Last fetch (or clone) that finished, successfully or not: the branch TTL counts from here.
+    checked: Option<Instant>,
+    /// Last successful fetch (or clone).
+    fetched: Option<Instant>,
+    /// The singleflight fetch in progress: when it started, and a flag flipped when it ends.
+    running: Option<(Instant, watch::Receiver<bool>)>,
+    /// 凭证失效: the last fetch failed authentication.
+    cred_invalid: bool,
 }
 
 #[derive(Default)]
@@ -77,6 +98,9 @@ impl RepoCache {
             next_tmp: AtomicU64::new(0),
             state: Mutex::default(),
             locks: Mutex::default(),
+            branch_ttl: Duration::from_secs(60),
+            fetch_timeout: Duration::from_secs(5),
+            fresh: Mutex::default(),
         })
     }
 
@@ -84,6 +108,13 @@ impl RepoCache {
     pub fn with_upstream(mut self, base: &str, git: &Path) -> RepoCache {
         self.base = base.into();
         self.git = git.into();
+        self
+    }
+
+    /// `branch_ttl` and `fetch_timeout` from `[cache]` (defaults 60 s and 5 s).
+    pub fn with_refresh(mut self, branch_ttl: Duration, fetch_timeout: Duration) -> RepoCache {
+        self.branch_ttl = branch_ttl;
+        self.fetch_timeout = fetch_timeout;
         self
     }
 
@@ -105,6 +136,8 @@ impl RepoCache {
 
     /// Returns the cached repo's path, cloning it first if needed and waiting up to `wait`
     /// (`warm_wait`). Times out with `repo_warming` + progress; the clone carries on regardless.
+    /// A cached repo past its branch TTL is fetched first (see [`RepoCache::refresh`]); a repo
+    /// marked 凭证失效 answers `upstream_unavailable`.
     pub async fn ensure(
         self: &Arc<Self>,
         url: &str,
@@ -124,8 +157,136 @@ impl RepoCache {
                 Err(_) => return Err(self.warming(url)),
             }
         }
+        self.refresh(url, cred).await;
+        if self.fresh_state(url, |f| f.cred_invalid) {
+            return Err(ErrorBody::new(
+                ErrorCode::UpstreamUnavailable,
+                format!("upstream rejected the credential for {url}"),
+            ));
+        }
         touch(&path);
         Ok(path)
+    }
+
+    /// Fetches a cached repo whose branch TTL has expired, waiting at most `fetch_timeout` from
+    /// the fetch's start; on timeout or failure the old refs stay and the fetch carries on.
+    /// Concurrent callers share one fetch. Also drives background refresh of the 预热列表.
+    pub async fn refresh(self: &Arc<Self>, url: &str, cred: Option<&Credential>) {
+        let ttl = self.branch_ttl;
+        self.fetch_if(url, cred, |f| f.checked.is_none_or(|t| t.elapsed() >= ttl))
+            .await;
+    }
+
+    /// For a rev that did not resolve: fetches (as [`RepoCache::refresh`]) unless the last
+    /// successful fetch is under 60 s old. The caller then retries the resolution once.
+    pub async fn refetch_for_unknown_rev(self: &Arc<Self>, url: &str, cred: Option<&Credential>) {
+        self.fetch_if(url, cred, |f| {
+            f.fetched.is_none_or(|t| t.elapsed() >= REV_REFETCH_AFTER)
+        })
+        .await;
+    }
+
+    fn fresh_state<T>(&self, url: &str, f: impl FnOnce(&mut Freshness) -> T) -> T {
+        f(self
+            .fresh
+            .lock()
+            .unwrap()
+            .entry(url.to_owned())
+            .or_default())
+    }
+
+    async fn fetch_if(
+        self: &Arc<Self>,
+        url: &str,
+        cred: Option<&Credential>,
+        due: impl FnOnce(&Freshness) -> bool,
+    ) {
+        if !self.path(url).exists() {
+            return;
+        }
+        let running = self.fresh_state(url, |f| {
+            if f.running.is_none() && due(f) {
+                let (tx, rx) = watch::channel(false);
+                f.running = Some((Instant::now(), rx));
+                let (this, url, cred) = (self.clone(), url.to_owned(), cred.cloned());
+                tokio::spawn(async move {
+                    this.fetch(&url, cred.as_ref()).await;
+                    tx.send_replace(true);
+                });
+            }
+            f.running.clone()
+        });
+        if let Some((started, mut done)) = running {
+            let deadline = started + self.fetch_timeout;
+            let _ = timeout_at(deadline.into(), done.wait_for(|d| *d)).await;
+        }
+    }
+
+    async fn fetch(&self, url: &str, cred: Option<&Credential>) {
+        let path = self.path(url);
+        let lock = self.lock(url);
+        let res = {
+            let _read = lock.read().await;
+            let remote = format!("{}{url}.git", self.base);
+            let mut fetch = self.git(cred);
+            fetch.arg("-C").arg(&path).args([
+                "fetch",
+                "-q",
+                "--prune",
+                "--no-write-fetch-head",
+                "--",
+                &remote,
+                // A bare clone has no fetch refspec of its own.
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+            ]);
+            match run(fetch).await {
+                Ok(()) => self.write_commit_graph(&path).await,
+                Err(e) => Err(e),
+            }
+        };
+        if res.is_ok() && count_packs(&path) > MAX_PACKS {
+            let _write = lock.write().await;
+            let mut repack = self.git(None);
+            repack
+                .arg("-C")
+                .arg(&path)
+                .args(["repack", "-q", "--geometric=2", "-d"]);
+            let res = match run(repack).await {
+                Ok(()) => self.write_commit_graph(&path).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = res {
+                tracing::warn!(url, error = %e, "repack failed");
+            }
+        }
+        let auth_failed = res.as_ref().is_err_and(|e| is_auth_failure(e));
+        if let Err(e) = &res {
+            tracing::warn!(url, error = %e, auth_failed, "fetch failed");
+        }
+        self.fresh_state(url, |f| {
+            let now = Instant::now();
+            f.checked = Some(now);
+            f.running = None;
+            if res.is_ok() {
+                f.fetched = Some(now);
+                f.cred_invalid = false;
+            } else if auth_failed {
+                f.cred_invalid = true;
+            }
+        });
+    }
+
+    async fn write_commit_graph(&self, repo: &Path) -> Result<(), String> {
+        let mut graph = self.git(None);
+        graph.arg("-C").arg(repo).args([
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--changed-paths",
+            "--split",
+        ]);
+        run(graph).await
     }
 
     /// `None` if `url` is already cached; otherwise the outcome of its (possibly new) clone.
@@ -159,6 +320,17 @@ impl RepoCache {
             let this = self.clone();
             tokio::spawn(async move {
                 let res = this.clone_repo(&job.url, job.cred.as_ref()).await;
+                if res.is_ok() {
+                    // A fresh clone counts as a successful fetch.
+                    let now = Instant::now();
+                    this.fresh_state(&job.url, |f| {
+                        *f = Freshness {
+                            checked: Some(now),
+                            fetched: Some(now),
+                            ..Freshness::default()
+                        }
+                    });
+                }
                 let mut st = this.state.lock().unwrap();
                 st.warming.remove(&job.url);
                 st.running -= 1;
@@ -264,6 +436,30 @@ async fn run(mut c: Command) -> Result<(), String> {
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
     }
+}
+
+/// Authentication failures as git reports them under `LC_ALL=C`; GitHub/GitLab answer a bad
+/// or revoked token with 401, which git turns into a failed username prompt.
+fn is_auth_failure(stderr: &str) -> bool {
+    [
+        "Authentication failed",
+        "could not read Username",
+        "could not read Password",
+        "returned error: 401",
+        "returned error: 403",
+    ]
+    .iter()
+    .any(|s| stderr.contains(s))
+}
+
+fn count_packs(repo: &Path) -> usize {
+    fs::read_dir(repo.join("objects/pack")).map_or(0, |d| {
+        d.filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "pack"))
+        })
+        .count()
+    })
 }
 
 /// Records an access for LRU 淘汰; best effort.
