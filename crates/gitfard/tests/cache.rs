@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use gitfar_proto::{ErrorCode, WarmingState};
 use gitfard::cache::RepoCache;
-use gitfard::config::Credential;
+use gitfard::config::{ConfigHandle, Credential};
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -477,4 +477,163 @@ async fn fetch_repacks_when_there_are_more_than_16_packs() {
     cache.ensure(&url, None, WAIT).await.unwrap();
 
     assert!(packs(&repo) <= 2, "{} packs", packs(&repo));
+}
+
+// ---- 淘汰, cache_full, 维护 (spec §4.5) ----
+
+/// Writes `<tmp>/gitfard.toml` with the given top-level and `[cache]` keys; `allowlist`
+/// defaults to `example.com/acme`, `disk_budget` to 1 TB and `disk_min_free` to 0.
+fn write_config(fx: &Fixture, top: &str, cache: &str) -> PathBuf {
+    let path = fx.tmp.path().join("gitfard.toml");
+    let mut top = top.to_owned();
+    if !top.contains("allowlist") {
+        top += "\nallowlist = [\"example.com/acme\"]";
+    }
+    let mut cache = cache.to_owned();
+    if !cache.contains("disk_budget") {
+        cache += "\ndisk_budget = \"1TB\"";
+    }
+    // The 10 GB default would make tests depend on the box's free disk.
+    if !cache.contains("disk_min_free") {
+        cache += "\ndisk_min_free = \"0B\"";
+    }
+    std::fs::write(
+        &path,
+        format!("{top}\n[server]\nlisten = \"127.0.0.1:0\"\ncache_dir = \"/unused\"\n[cache]\n{cache}\n"),
+    )
+    .unwrap();
+    path
+}
+
+fn open_with(fx: &Fixture, git: &Path) -> (Arc<RepoCache>, Arc<ConfigHandle>) {
+    let cfg = Arc::new(ConfigHandle::load(write_config(fx, "", "")).unwrap());
+    let base = format!("file://{}/up/", fx.tmp.path().display());
+    let cache = RepoCache::open(&fx.cache_dir(), 2)
+        .unwrap()
+        .with_upstream(&base, git)
+        .with_config(cfg.clone());
+    (Arc::new(cache), cfg)
+}
+
+/// Apparent bytes of every file under `dir`.
+fn size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                size(&e.path())
+            } else {
+                m.len()
+            }
+        })
+        .sum()
+}
+
+const OUTSIDE_WINDOW: u16 = 12 * 60;
+const INSIDE_WINDOW: u16 = 4 * 60;
+// No real disk has 1000 TB free, so this simulates a full disk.
+const DISK_FULL: &str = "disk_min_free = \"1000TB\"";
+
+#[tokio::test]
+async fn over_budget_evicts_the_least_recently_used_repo_except_warm_list() {
+    let fx = Fixture::new();
+    let [a, b, c] = ["a", "b", "c"].map(|n| fx.upstream(n));
+    let (cache, cfg) = open_with(&fx, &fx.slow_git());
+    for url in [&a, &b, &c, &a] {
+        cache.ensure(url, None, WAIT).await.unwrap();
+    }
+    // LRU order is now b, c, a; b is on the 预热列表, so c goes first.
+    let total: u64 = [&a, &b, &c].iter().map(|u| size(&cache.path(u))).sum();
+    write_config(
+        &fx,
+        &format!("warm_list = [\"{b}\"]"),
+        &format!("disk_budget = \"{}B\"", total - 1),
+    );
+    cfg.reload().unwrap();
+
+    cache.tick(OUTSIDE_WINDOW).await;
+
+    assert!(cache.path(&a).exists());
+    assert!(cache.path(&b).exists());
+    assert!(!cache.path(&c).exists());
+    cache.ensure(&c, None, WAIT).await.unwrap();
+    assert_eq!(fx.clones(), 4, "an evicted repo is 预热ed again");
+}
+
+#[tokio::test]
+async fn low_free_disk_refuses_new_clones_but_cached_repos_still_serve() {
+    let fx = Fixture::new();
+    let [a, b] = ["a", "b"].map(|n| fx.upstream(n));
+    let (cache, cfg) = open_with(&fx, Path::new("git"));
+    cache.ensure(&a, None, WAIT).await.unwrap();
+
+    write_config(&fx, "", DISK_FULL);
+    cfg.reload().unwrap();
+
+    let err = cache.ensure(&b, None, WAIT).await.unwrap_err();
+    assert_eq!(err.error.code, ErrorCode::CacheFull);
+    assert_eq!(cache.ensure(&a, None, WAIT).await.unwrap(), cache.path(&a));
+}
+
+#[tokio::test]
+async fn disk_running_low_aborts_the_clone_in_progress_and_cleans_up() {
+    let fx = Fixture::new();
+    let a = fx.upstream("a");
+    let (cache, cfg) = open_with(&fx, &fx.slow_git());
+
+    let pending = {
+        let (cache, a) = (cache.clone(), a.clone());
+        tokio::spawn(async move { cache.ensure(&a, None, WAIT).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    write_config(&fx, "", DISK_FULL);
+    cfg.reload().unwrap();
+
+    let err = pending.await.unwrap().unwrap_err();
+    assert_eq!(err.error.code, ErrorCode::CacheFull);
+    assert!(!cache.path(&a).exists());
+    assert_eq!(
+        std::fs::read_dir(fx.cache_dir().join("tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn full_gc_and_allowlist_cleanup_run_only_inside_the_maintenance_window() {
+    let fx = Fixture::new();
+    let [a, gone] = ["a", "gone"].map(|n| fx.upstream(n));
+    // Logs every `git gc` run.
+    let spy = fx.tmp.path().join("gc-git");
+    let gcs = fx.tmp.path().join("gcs.log");
+    std::fs::write(
+        &spy,
+        format!(
+            "#!/bin/sh\nfor a; do [ \"$a\" = gc ] && echo gc >> '{}'; done\nexec git \"$@\"\n",
+            gcs.display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&spy).status().unwrap();
+    let (cache, cfg) = open_with(&fx, &spy);
+    cache.ensure(&a, None, WAIT).await.unwrap();
+    cache.ensure(&gone, None, WAIT).await.unwrap();
+    write_config(&fx, &format!("allowlist = [\"{a}\"]"), "");
+    cfg.reload().unwrap();
+    let gc_runs = || std::fs::read_to_string(&gcs).map_or(0, |s| s.lines().count());
+
+    cache.tick(OUTSIDE_WINDOW).await;
+    assert_eq!(gc_runs(), 0, "no full gc outside the window");
+    assert!(cache.path(&gone).exists());
+
+    cache.tick(INSIDE_WINDOW).await;
+    assert_eq!(gc_runs(), 1);
+    assert!(!cache.path(&gone).exists(), "no longer allowlisted");
+    cache.ensure(&a, None, WAIT).await.unwrap();
+
+    cache.tick(INSIDE_WINDOW).await;
+    assert_eq!(gc_runs(), 1, "gc is daily, not every tick");
 }
