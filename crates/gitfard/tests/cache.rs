@@ -1,0 +1,261 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use gitfar_proto::{ErrorCode, WarmingState};
+use gitfard::cache::RepoCache;
+use gitfard::config::Credential;
+use tempfile::TempDir;
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "git {args:?}");
+    String::from_utf8(o.stdout).unwrap()
+}
+
+/// Upstreams live at `<tmp>/up/example.com/acme/<name>.git`, served as `file://<tmp>/up/`.
+struct Fixture {
+    tmp: TempDir,
+}
+
+impl Fixture {
+    fn new() -> Fixture {
+        Fixture {
+            tmp: TempDir::new().unwrap(),
+        }
+    }
+
+    /// An upstream whose default branch is `trunk`, with a tag and a platform-private ref.
+    fn upstream(&self, name: &str) -> String {
+        let work = self.tmp.path().join("work").join(name);
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "trunk"]);
+        std::fs::write(work.join("a.txt"), "hello\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        git(&work, &["tag", "v1"]);
+        let dst = self
+            .tmp
+            .path()
+            .join(format!("up/example.com/acme/{name}.git"));
+        git(
+            &work,
+            &["clone", "-q", "--bare", ".", dst.to_str().unwrap()],
+        );
+        git(&dst, &["update-ref", "refs/pull/1/head", "HEAD"]);
+        format!("example.com/acme/{name}")
+    }
+
+    fn cache_dir(&self) -> PathBuf {
+        self.tmp.path().join("cache")
+    }
+
+    /// A `git` wrapper that logs and slows down every clone, so tests can count and overlap them.
+    fn slow_git(&self) -> PathBuf {
+        let path = self.tmp.path().join("slow-git");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = clone ]; then echo x >> '{}'; sleep 1; fi\nexec git \"$@\"\n",
+                self.clone_log().display()
+            ),
+        )
+        .unwrap();
+        Command::new("chmod").arg("+x").arg(&path).status().unwrap();
+        path
+    }
+
+    fn clone_log(&self) -> PathBuf {
+        self.tmp.path().join("clones.log")
+    }
+
+    fn clones(&self) -> usize {
+        std::fs::read_to_string(self.clone_log()).map_or(0, |s| s.lines().count())
+    }
+
+    fn open(&self, concurrency: usize, git: &Path) -> Arc<RepoCache> {
+        let base = format!("file://{}/up/", self.tmp.path().display());
+        Arc::new(
+            RepoCache::open(&self.cache_dir(), concurrency)
+                .unwrap()
+                .with_upstream(&base, git),
+        )
+    }
+}
+
+const WAIT: Duration = Duration::from_secs(20);
+const SHORT: Duration = Duration::from_millis(100);
+
+#[tokio::test]
+async fn first_request_clones_a_full_bare_mirror_of_heads_and_tags() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open(2, Path::new("git"));
+
+    let repo = cache.ensure(&url, None, WAIT).await.unwrap();
+
+    assert_eq!(repo, fx.cache_dir().join("repos/example.com/acme/x.git"));
+    assert_eq!(git(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/trunk\n");
+    assert_eq!(
+        git(&repo, &["for-each-ref", "--format=%(refname)"]),
+        "refs/heads/trunk\nrefs/tags/v1\n"
+    );
+    assert!(repo.join("objects/info/commit-graph").exists());
+    assert!(repo.join("gitfar-access").exists(), "touch file");
+}
+
+#[tokio::test]
+async fn concurrent_requests_share_one_clone() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    let cache = fx.open(2, &fx.slow_git());
+
+    let tasks: Vec<_> = (0..5)
+        .map(|_| {
+            let (cache, url) = (cache.clone(), url.clone());
+            tokio::spawn(async move { cache.ensure(&url, None, WAIT).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+    assert_eq!(fx.clones(), 1);
+
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    assert_eq!(fx.clones(), 1, "cached repo is not cloned again");
+}
+
+#[tokio::test]
+async fn third_concurrent_clone_queues_and_reports_its_position() {
+    let fx = Fixture::new();
+    let urls: Vec<_> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|n| fx.upstream(n))
+        .collect();
+    let cache = fx.open(2, &fx.slow_git());
+
+    let mut progress = Vec::new();
+    for url in &urls {
+        let err = cache.ensure(url, None, SHORT).await.unwrap_err();
+        assert_eq!(err.error.code, ErrorCode::RepoWarming);
+        let p = err.error.progress.unwrap();
+        progress.push((p.state, p.queue_position));
+    }
+    assert_eq!(
+        progress,
+        [
+            (WarmingState::Cloning, None),
+            (WarmingState::Cloning, None),
+            (WarmingState::Queued, Some(1)),
+            (WarmingState::Queued, Some(2)),
+        ]
+    );
+
+    for url in &urls {
+        cache.ensure(url, None, WAIT).await.unwrap();
+    }
+    assert_eq!(fx.clones(), 4);
+}
+
+#[tokio::test]
+async fn failed_clone_is_an_error_and_the_next_request_retries() {
+    let fx = Fixture::new();
+    let cache = fx.open(2, Path::new("git"));
+    let url = "example.com/acme/later";
+
+    let err = cache.ensure(url, None, WAIT).await.unwrap_err();
+    assert_eq!(err.error.code, ErrorCode::UpstreamUnavailable);
+    assert!(!fx
+        .cache_dir()
+        .join("repos/example.com/acme/later.git")
+        .exists());
+
+    fx.upstream("later");
+    cache.ensure(url, None, WAIT).await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_discards_half_finished_clones() {
+    let fx = Fixture::new();
+    let url = fx.upstream("x");
+    // What a killed process leaves behind: a partial clone in the temp area, nothing under repos/.
+    std::fs::create_dir_all(fx.cache_dir().join("tmp/7/objects")).unwrap();
+
+    let cache = fx.open(2, Path::new("git"));
+
+    assert_eq!(
+        std::fs::read_dir(fx.cache_dir().join("tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
+    cache.ensure(&url, None, WAIT).await.unwrap();
+    assert_eq!(
+        std::fs::read_dir(fx.cache_dir().join("tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn a_second_process_cannot_open_the_same_cache_dir() {
+    let fx = Fixture::new();
+    let _first = RepoCache::open(&fx.cache_dir(), 2).unwrap();
+    assert!(RepoCache::open(&fx.cache_dir(), 2).is_err());
+}
+
+#[tokio::test]
+async fn clone_with_a_credential_leaves_no_secret_in_repo_config() {
+    let fx = Fixture::new();
+    let url = fx.upstream("private");
+    let cred: Credential =
+        toml::from_str("prefix = \"example.com/acme\"\ntoken = \"s3cr3t-token\"").unwrap();
+    // Records the env-injected git config the clone ran with.
+    let spy = fx.tmp.path().join("spy-git");
+    let seen = fx.tmp.path().join("seen");
+    std::fs::write(
+        &spy,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = clone ] && echo \"$GIT_CONFIG_KEY_0=$GIT_CONFIG_VALUE_0\" > '{}'\nexec git \"$@\"\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&spy).status().unwrap();
+    let cache = fx.open(2, &spy);
+
+    let repo = cache.ensure(&url, Some(&cred), WAIT).await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&seen).unwrap(),
+        format!(
+            "http.file://{}/up/example.com/acme/.extraHeader=Authorization: Basic eC1hY2Nlc3MtdG9rZW46czNjcjN0LXRva2Vu\n",
+            fx.tmp.path().display()
+        )
+    );
+    let config = std::fs::read_to_string(repo.join("config")).unwrap();
+    assert!(!config.contains("s3cr3t"), "{config}");
+    assert!(!config.contains("Basic"), "{config}");
+    assert!(
+        !config.to_ascii_lowercase().contains("extraheader"),
+        "{config}"
+    );
+}
