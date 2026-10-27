@@ -2,16 +2,18 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, MethodRouter};
 use axum::{Extension, Json, Router};
-use gitfar_proto::{ErrorBody, ErrorCode};
+use gitfar_proto::{ErrorBody, ErrorCode, Primitive};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::cache::RepoCache;
 use crate::config::ConfigHandle;
 
 /// The authenticated caller, inserted into request extensions by the bearer middleware.
@@ -22,11 +24,41 @@ pub struct TokenCtx {
     pub scope: Option<Vec<String>>,
 }
 
-pub fn router(config: Arc<ConfigHandle>) -> Router {
+pub fn router(config: Arc<ConfigHandle>, cache: Arc<RepoCache>) -> Router {
+    let prim = |p: Primitive| primitive(p, config.clone(), cache.clone());
     Router::new()
         .route("/v1/whoami", get(whoami))
+        .route("/v1/read", prim(Primitive::Read))
+        .route("/v1/list", prim(Primitive::List))
         .layer(middleware::from_fn_with_state(config, bearer))
         .route("/healthz", get(|| async { "ok" }))
+}
+
+/// `POST /v1/{primitive}`: any body problem, including invalid JSON, is `invalid_argument`.
+fn primitive(p: Primitive, config: Arc<ConfigHandle>, cache: Arc<RepoCache>) -> MethodRouter {
+    post(
+        move |Extension(t): Extension<TokenCtx>, body: Bytes| async move {
+            let res = match serde_json::from_slice(&body) {
+                Ok(body) => crate::exec::run(&config, &cache, t.scope.as_deref(), p, body).await,
+                Err(e) => Err(ErrorBody::new(ErrorCode::InvalidArgument, e.to_string())),
+            };
+            match res {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => error(e),
+            }
+        },
+    )
+}
+
+fn error(body: ErrorBody) -> Response {
+    let code = body.error.code;
+    let status = StatusCode::from_u16(code.http_status()).expect("valid status");
+    let mut resp = (status, Json(body)).into_response();
+    if code == ErrorCode::RepoWarming {
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+    }
+    resp
 }
 
 async fn whoami(Extension(t): Extension<TokenCtx>) -> Json<TokenCtx> {

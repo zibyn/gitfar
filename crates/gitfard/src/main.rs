@@ -71,6 +71,14 @@ async fn main() -> ExitCode {
     tracing::info!("config loaded");
     handle.current().warn_if_no_client_tokens();
 
+    let cfg = handle.current();
+    let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("gitfard: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let listen = handle.current().server.listen;
     let listener = match tokio::net::TcpListener::bind(listen).await {
         Ok(l) => l,
@@ -80,21 +88,13 @@ async fn main() -> ExitCode {
         }
     };
     tracing::info!(%listen, "API listening");
-    let app = gitfard::http::router(handle.clone());
+    let app = gitfard::http::router(handle.clone(), cache.clone());
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "API server stopped");
         }
     });
 
-    let cfg = handle.current();
-    let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            eprintln!("gitfard: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     for url in &cfg.warm_list {
         match authorize(&cfg, None, url) {
             Ok(cred) => cache.preheat(url, cred),
