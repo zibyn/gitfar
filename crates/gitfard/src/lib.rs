@@ -9,3 +9,4 @@ pub mod git;
 pub mod http;
 pub mod mcp;
 pub mod token;
+pub mod upstream;

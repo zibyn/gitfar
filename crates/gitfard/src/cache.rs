@@ -7,7 +7,7 @@
 //! The cache reads its config live (SIGHUP applies) and enforces `disk_budget` (LRU 淘汰), `disk_min_free`
 //! (`cache_full`) and runs the daily maintenance window from [`RepoCache::tick`].
 //!
-//! 上游限速 (§4.5): clones and fetches take a per-host slot; a 429/503 puts the whole host in
+//! 上游限速 (§4.5, [`crate::upstream`]): clones and fetches take a per-host slot; a 429/503 puts the whole host in
 //! 冷却 (due fetches skipped, queued clones held); deterministic clone failures are 负缓存'd.
 
 use std::collections::{HashMap, VecDeque};
@@ -19,14 +19,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use gitfar_proto::{ErrorBody, ErrorCode, WarmingProgress, WarmingState};
-use rand::RngExt;
-use tokio::sync::{watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock};
 use tokio::time::timeout_at;
 
 use crate::admin::METRICS;
 use crate::authz::authorize;
 use crate::config::{Config, ConfigHandle, Credential, Upstream};
 use crate::git::{run, run_out, Git, GitError, GitFailure};
+use crate::upstream::UpstreamLimits;
 
 const TOUCH_FILE: &str = "gitfar-access";
 /// An unresolvable rev triggers a fetch only if the last successful one is older than this (§4.5).
@@ -52,18 +52,7 @@ pub struct RepoCache {
     config: Arc<ConfigHandle>,
     /// One 淘汰 pass at a time, so concurrent passes don't each evict for the same overrun.
     evicting: tokio::sync::Mutex<()>,
-    hosts: Mutex<HashMap<String, Host>>,
-}
-
-/// Per-host upstream state (in memory only).
-struct Host {
-    /// Clone + fetch concurrency for this host, sized `slots_size` (0 = not sized yet).
-    slots: Arc<Semaphore>,
-    slots_size: usize,
-    /// 冷却 end, if one was ever set.
-    cool_until: Option<Instant>,
-    /// Consecutive rate limits, for the exponential backoff; reset by any success.
-    strikes: u32,
+    upstream: UpstreamLimits,
 }
 
 /// Per-repo refresh state; in memory only, so after a restart the first request fetches.
@@ -123,7 +112,7 @@ impl RepoCache {
             state: Mutex::default(),
             locks: Mutex::default(),
             fresh: Mutex::default(),
-            hosts: Mutex::default(),
+            upstream: UpstreamLimits::new(config.clone()),
             config,
             evicting: tokio::sync::Mutex::default(),
         })
@@ -154,15 +143,7 @@ impl RepoCache {
 
     /// Hosts in 冷却 and the time left, by host (for the admin port).
     pub fn cooldowns(&self) -> Vec<(String, Duration)> {
-        let now = Instant::now();
-        let hosts = self.hosts.lock().unwrap();
-        let mut v: Vec<_> = hosts
-            .iter()
-            .filter_map(|(h, s)| Some((h.clone(), s.cool_until?.checked_duration_since(now)?)))
-            .filter(|(_, left)| !left.is_zero())
-            .collect();
-        v.sort();
-        v
+        self.upstream.snapshot(Instant::now())
     }
 
     /// Every repo cloning or queued: cloning first, then in queue order (for the admin port).
@@ -330,7 +311,7 @@ impl RepoCache {
         if !self.path(url).exists() {
             return;
         }
-        let cooling = self.cooling(host(url));
+        let cooling = self.upstream.cooling(host(url), Instant::now());
         let running = self.fresh_state(url, |f| {
             if f.running.is_none() && !cooling && due(f) {
                 let (tx, rx) = watch::channel(false);
@@ -356,7 +337,7 @@ impl RepoCache {
             let _read = lock.read().await;
             // shortcut: a fetch already waiting for a slot still runs if the host starts cooling
             // meanwhile; re-check after acquiring if bursts after a 429 become a problem.
-            let _slot = self.slot(url).await;
+            let _slot = self.upstream.slot(host(url)).await;
             let remote = self.git.remote(url);
             let mut fetch = self.git.command(cred);
             fetch.arg("-C").arg(&path).args([
@@ -505,7 +486,12 @@ impl RepoCache {
         let limit = self.config().cache.clone_concurrency.max(1);
         while st.running < limit && !self.disk_low() {
             // Clones to a cooling host stay queued; the cooldown's end pumps again.
-            let Some(i) = st.queue.iter().position(|j| !self.cooling(host(&j.url))) else {
+            let now = Instant::now();
+            let Some(i) = st
+                .queue
+                .iter()
+                .position(|j| !self.upstream.cooling(host(&j.url), now))
+            else {
                 return;
             };
             let job = st.queue.remove(i).unwrap();
@@ -567,8 +553,9 @@ impl RepoCache {
         let mut body = ErrorBody::new(ErrorCode::RepoWarming, format!("{url} is being cloned"));
         let progress = self.progress(&st, url);
         if progress.state == WarmingState::RateLimited {
-            let until = self.host_state(url, |h| h.cool_until);
-            body.retry_after = until.map(|t| t.saturating_duration_since(Instant::now()));
+            let now = Instant::now();
+            let until = self.upstream.cool_until(host(url), now);
+            body.retry_after = until.map(|t| t - now);
         }
         body.error.progress = Some(progress);
         body
@@ -579,36 +566,13 @@ impl RepoCache {
         WarmingProgress {
             state: match position {
                 None => WarmingState::Cloning,
-                Some(_) if self.cooling(host(url)) => WarmingState::RateLimited,
+                Some(_) if self.upstream.cooling(host(url), Instant::now()) => {
+                    WarmingState::RateLimited
+                }
                 Some(_) => WarmingState::Queued,
             },
             queue_position: position.map(|p| p as u32 + 1),
         }
-    }
-
-    /// Waits for one of this host's clone + fetch slots.
-    async fn slot(&self, url: &str) -> OwnedSemaphorePermit {
-        let size = self.limits().host_concurrency.max(1);
-        let slots = self.host_state(url, |h| {
-            // A reloaded `host_concurrency` takes a fresh semaphore.
-            // shortcut: permits held on the old one don't count against it, so the host can briefly
-            // see old + new slots; drain the old one first if that ever matters.
-            if h.slots_size != size {
-                (h.slots, h.slots_size) = (Arc::new(Semaphore::new(size)), size);
-            }
-            h.slots.clone()
-        });
-        slots.acquire_owned().await.expect("never closed")
-    }
-
-    fn host_state<T>(&self, url: &str, f: impl FnOnce(&mut Host) -> T) -> T {
-        let mut hosts = self.hosts.lock().unwrap();
-        f(hosts.entry(host(url).to_owned()).or_insert_with(|| Host {
-            slots: Arc::new(Semaphore::new(0)),
-            slots_size: 0,
-            cool_until: None,
-            strikes: 0,
-        }))
     }
 
     fn branch_ttl(&self) -> Duration {
@@ -623,38 +587,15 @@ impl RepoCache {
         self.config().upstream.clone()
     }
 
-    fn cooling(&self, host: &str) -> bool {
-        let hosts = self.hosts.lock().unwrap();
-        hosts
-            .get(host)
-            .and_then(|h| h.cool_until)
-            .is_some_and(|t| t > Instant::now())
-    }
-
-    /// Feeds a clone or fetch result into the host's 冷却 state: 429/503 starts (or extends) a
-    /// cooldown for `Retry-After`, else exponential backoff with jitter; a success resets it.
+    /// Feeds a clone or fetch result into 上游限速; when it starts a 冷却, queued clones to the
+    /// host wait for its end, which pumps the queue again.
     fn record(self: &Arc<Self>, url: &str, res: &Result<(), GitError>) {
-        let retry_after = match res {
-            Ok(()) => return self.host_state(url, |h| h.strikes = 0),
-            Err(GitError {
-                kind: GitFailure::RateLimited { retry_after },
-                ..
-            }) => *retry_after,
-            Err(_) => return,
+        let now = Instant::now();
+        let res = res.as_ref().map(drop).map_err(|e| e.kind);
+        let Some(until) = self.upstream.record(host(url), res, now) else {
+            return;
         };
-        let limits = self.limits();
-        let until = self.host_state(url, |h| {
-            h.strikes += 1;
-            let backoff = limits
-                .cooldown_initial
-                .saturating_mul(1 << (h.strikes - 1).min(16))
-                .min(limits.cooldown_max)
-                .mul_f64(rand::rng().random_range(0.8..=1.0));
-            let until = Instant::now() + retry_after.unwrap_or(backoff);
-            h.cool_until = h.cool_until.max(Some(until));
-            until
-        });
-        tracing::warn!(host = host(url), cooldown = ?until.saturating_duration_since(Instant::now()), "upstream rate limited, host cooling");
+        tracing::warn!(host = host(url), cooldown = ?until - now, "upstream rate limited, host cooling");
         let this = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep_until(until.into()).await;
@@ -703,7 +644,7 @@ impl RepoCache {
             .args(["clone", "--bare", "-q", "--", &remote])
             .arg(tmp);
         let res = {
-            let _slot = self.slot(url).await;
+            let _slot = self.upstream.slot(host(url)).await;
             let out = run(clone);
             tokio::pin!(out);
             loop {
