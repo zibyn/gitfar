@@ -5,11 +5,12 @@ version.workspace = true
 
 [dependencies]
 arc-swap = "1"
+base64.workspace = true
 clap = { version = "4", features = ["derive"] }
 gitfar-proto.workspace = true
 jiff = { version = "0.2", features = ["serde"] }
 serde.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
