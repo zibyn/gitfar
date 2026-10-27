@@ -72,6 +72,11 @@ async fn main() -> ExitCode {
     handle.current().warn_if_no_client_tokens();
 
     let cfg = handle.current();
+    gitfard::exec::grep::init(
+        cfg.server.scan_threads,
+        cfg.cache.blob_lru,
+        cfg.cache.blob_lru_max_object,
+    );
     let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
         // shortcut: branch_ttl/fetch_timeout are read once; a SIGHUP reload doesn't change them.
         Ok(c) => Arc::new(

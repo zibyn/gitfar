@@ -33,6 +33,7 @@ pub fn router(config: Arc<ConfigHandle>, cache: Arc<RepoCache>) -> Router {
         .route("/v1/log", prim(Primitive::Log))
         .route("/v1/show", prim(Primitive::Show))
         .route("/v1/blame", prim(Primitive::Blame))
+        .route("/v1/grep", prim(Primitive::Grep))
         .layer(middleware::from_fn_with_state(config, bearer))
         .route("/healthz", get(|| async { "ok" }))
 }

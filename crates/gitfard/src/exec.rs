@@ -2,6 +2,7 @@
 
 mod blame;
 mod git;
+pub mod grep;
 mod list;
 mod log;
 mod read;
@@ -10,7 +11,7 @@ mod show;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::Instant;
 
 use gitfar_proto::{Cursor, ErrorBody, ErrorCode, Params, Primitive, Request, Resume};
 use gix::ObjectId;
@@ -38,13 +39,13 @@ pub async fn run(
     };
     let (repo, rev) = target(&job);
     let cfg = config.current();
+    let deadline = Instant::now() + cfg.server.request_deadline;
     let url = canonicalize(repo).map_err(|e| ErrorBody::new(ErrorCode::InvalidArgument, e))?;
     let cred = authorize(&cfg, scope, &url)
         .map_err(|code| ErrorBody::new(code, "repository not found"))?;
     let path = cache.ensure(&url, cred, cfg.cache.warm_wait).await?;
     let resumed = pinned.is_some();
     let rev = pinned.unwrap_or_else(|| rev.unwrap_or("HEAD").to_owned());
-    let deadline = cfg.server.request_deadline;
     let attempt = || {
         execute(
             cache,
@@ -72,7 +73,7 @@ async fn execute(
     path: PathBuf,
     rev: String,
     job: Resume,
-    deadline: Duration,
+    deadline: Instant,
 ) -> Result<serde_json::Value, ErrorBody> {
     let guard = cache.lock(url).read_owned().await;
     let cache = cache.clone();
@@ -113,6 +114,9 @@ async fn execute(
             }
             Resume::Blame { params, next_line } => {
                 serde_json::to_value(blame::run(&commit, &git, params, next_line)?)
+            }
+            Resume::Grep { params, path, line } => {
+                serde_json::to_value(grep::run(&commit, params, (path, line), deadline)?)
             }
             other => {
                 return Err(internal(format!(

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::Instant;
 
 use gitfar_proto::{ErrorBody, ErrorCode};
 use tokio::io::AsyncReadExt;
@@ -23,7 +23,7 @@ pub(super) fn semaphore() -> &'static Semaphore {
 pub(super) struct Git {
     pub cache: Arc<RepoCache>,
     pub dir: PathBuf,
-    pub deadline: Duration,
+    pub deadline: Instant,
 }
 
 impl Git {
@@ -65,7 +65,7 @@ impl Git {
         };
         // The child is `kill_on_drop`, so a timeout kills it.
         tokio::runtime::Handle::current().block_on(async {
-            tokio::time::timeout(self.deadline, fut)
+            tokio::time::timeout_at(self.deadline.into(), fut)
                 .await
                 .unwrap_or_else(|_| {
                     Err(ErrorBody::new(
