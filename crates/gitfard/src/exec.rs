@@ -1,7 +1,7 @@
 //! 检索执行: the request pipeline shared by HTTP and MCP (spec §1.1 ②–⑧) and its executors (§4.6).
 
 mod blame;
-mod git;
+mod cli;
 pub mod grep;
 mod list;
 mod log;
@@ -143,7 +143,7 @@ async fn execute(
         let _guard = guard;
         // shortcut: opens the repo per request (cheap, ~ms); keep a ThreadSafeRepository per cached repo if it shows in profiles.
         let repo = gix::open_opts(&path, gix::open::Options::isolated()).map_err(internal)?;
-        let git = git::Runner {
+        let git = cli::Runner {
             git,
             dir: path,
             deadline,
@@ -190,8 +190,8 @@ async fn execute(
 
 /// git CLI children running now and their limit (for `/metrics`).
 pub(crate) fn git_processes() -> (usize, usize) {
-    let limit = git::limit();
-    (limit - git::semaphore().available_permits(), limit)
+    let limit = cli::limit();
+    (limit - cli::semaphore().available_permits(), limit)
 }
 
 fn fresh(p: Params) -> Resume {

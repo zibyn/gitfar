@@ -4,7 +4,7 @@ use gitfar_proto::{
     BlameParams, BlameResponse, ErrorBody, ErrorCode, NoMeta, Resume, TruncatedReason,
 };
 
-use super::git::Runner;
+use super::cli::Runner;
 use super::{internal, invalid, lookup, next, Node, BYTE_CAP};
 
 const MAX_LINES: u32 = 500;

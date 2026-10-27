@@ -57,7 +57,7 @@ fn consecutive_rate_limits_double_the_backoff_up_to_cooldown_max() {
         .collect();
     assert!((16.0..=20.0).contains(&ends[1]), "{ends:?}");
     assert!((20.0..=25.0).contains(&ends[2]), "{ends:?}");
-    assert!(ends[3] <= 25.0, "{ends:?}");
+    assert!((20.0..=25.0).contains(&ends[3]), "{ends:?}");
 }
 
 #[test]

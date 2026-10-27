@@ -6,7 +6,7 @@ use gitfar_proto::{
 use gix::revision::plumbing::Spec;
 use gix::ObjectId;
 
-use super::git::{pathspecs, Runner};
+use super::cli::{pathspecs, Runner};
 use super::{invalid, next, BYTE_CAP};
 
 pub(super) fn run(

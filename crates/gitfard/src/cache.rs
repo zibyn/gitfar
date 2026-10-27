@@ -24,7 +24,7 @@ use tokio::time::timeout_at;
 
 use crate::admin::METRICS;
 use crate::authz::authorize;
-use crate::config::{Config, ConfigHandle, Credential, Upstream};
+use crate::config::{Config, ConfigHandle, Credential};
 use crate::git::{run, run_out, Git, GitError, GitFailure};
 use crate::upstream::UpstreamLimits;
 
@@ -391,9 +391,13 @@ impl RepoCache {
                 tracing::warn!(url, error = %e, "repack failed");
             }
         }
-        let auth_failed = res
-            .as_ref()
-            .is_err_and(|e| e.kind == GitFailure::AuthFailed);
+        let auth_failed = matches!(
+            res,
+            Err(GitError {
+                kind: GitFailure::AuthFailed,
+                ..
+            })
+        );
         match &res {
             Ok(()) => tracing::info!(url, "fetched"),
             Err(e) => tracing::warn!(url, error = %e, auth_failed, "fetch failed"),
@@ -518,7 +522,7 @@ impl RepoCache {
                     }
                     Err(Failed::Final(code, negative)) => {
                         if negative {
-                            let until = Instant::now() + this.limits().negative_cache_ttl;
+                            let until = Instant::now() + this.config().upstream.negative_cache_ttl;
                             let mut st = this.state.lock().unwrap();
                             st.negative.insert(job.url.clone(), (until, code));
                         }
@@ -581,10 +585,6 @@ impl RepoCache {
 
     fn fetch_timeout(&self) -> Duration {
         self.config().cache.fetch_timeout
-    }
-
-    fn limits(&self) -> Upstream {
-        self.config().upstream.clone()
     }
 
     /// Feeds a clone or fetch result into 上游限速; when it starts a 冷却, queued clones to the
