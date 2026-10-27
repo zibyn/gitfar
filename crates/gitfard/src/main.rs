@@ -56,6 +56,9 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
+    // Installed first, so a SIGTERM during startup is a clean shutdown rather than a kill.
+    let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let handle = match ConfigHandle::load(config) {
         Ok(h) => Arc::new(h),
         Err(e) => {
@@ -69,6 +72,18 @@ async fn main() -> ExitCode {
         LogFormat::Pretty => logs.pretty().init(),
     }
     tracing::info!("config loaded");
+    let git = tokio::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .await;
+    match git {
+        Ok(o) if gitfard::admin::git_version_ok(&String::from_utf8_lossy(&o.stdout)) => {}
+        other => {
+            let found = other.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+            tracing::error!(?found, "git >= 2.33 is required");
+            return ExitCode::FAILURE;
+        }
+    }
     handle.current().warn_if_no_client_tokens();
 
     let cfg = handle.current();
@@ -90,19 +105,37 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let listen = handle.current().server.listen;
-    let listener = match tokio::net::TcpListener::bind(listen).await {
+    let (listen, admin_listen) = (cfg.server.listen, cfg.server.admin_listen);
+    let (listener, admin) = match tokio::try_join!(
+        tokio::net::TcpListener::bind(listen),
+        tokio::net::TcpListener::bind(admin_listen)
+    ) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(%listen, error = %e, "cannot bind API listener");
+            tracing::error!(%listen, %admin_listen, error = %e, "cannot bind listeners");
             return ExitCode::FAILURE;
         }
     };
-    tracing::info!(%listen, "API listening");
+    // Both log the bound address (port 0 picks one).
+    tracing::info!(listen = %listener.local_addr().unwrap(), "API listening");
+    tracing::info!(admin_listen = %admin.local_addr().unwrap(), "admin listening");
+    let (stop, stopped) = tokio::sync::watch::channel(false);
     let app = gitfard::http::router(handle.clone(), cache.clone());
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+    let api = tokio::spawn(async move {
+        let mut stopped = stopped;
+        let res = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stopped.wait_for(|s| *s).await;
+            })
+            .await;
+        if let Err(e) = res {
             tracing::error!(error = %e, "API server stopped");
+        }
+    });
+    let admin_app = gitfard::admin::router(handle.clone(), cache.clone());
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(admin, admin_app).await {
+            tracing::error!(error = %e, "admin server stopped");
         }
     });
 
@@ -143,8 +176,6 @@ async fn main() -> ExitCode {
         }
     });
 
-    let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     loop {
         tokio::select! {
             _ = hup.recv() => {
@@ -154,6 +185,15 @@ async fn main() -> ExitCode {
             _ = term.recv() => break,
             _ = tokio::signal::ctrl_c() => break,
         }
+    }
+    // Stop accepting; in-flight requests get at most one request deadline. Returning drops the
+    // runtime's tasks, which aborts clones and kills git children (kill_on_drop); clone residue
+    // in tmp/ is wiped at the next start.
+    tracing::info!("shutting down");
+    stop.send_replace(true);
+    let grace = handle.current().server.request_deadline;
+    if tokio::time::timeout(grace, api).await.is_err() {
+        tracing::warn!(?grace, "in-flight requests cut off at shutdown");
     }
     ExitCode::SUCCESS
 }

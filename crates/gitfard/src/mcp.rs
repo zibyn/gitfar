@@ -136,8 +136,7 @@ impl ServerHandler for Mcp {
             .and_then(|parts| parts.extensions.get::<TokenCtx>())
             .ok_or_else(|| ErrorData::internal_error("no authenticated caller", None))?;
         let args = Value::Object(req.arguments.unwrap_or_default());
-        let res =
-            crate::exec::run(&self.config, &self.cache, token.scope.as_deref(), p, args).await;
+        let res = crate::exec::run(&self.config, &self.cache, token, p, args).await;
         Ok(tool_result(res).into())
     }
 }

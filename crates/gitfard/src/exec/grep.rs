@@ -55,7 +55,11 @@ pub fn init(threads: usize, lru_budget: Option<u64>, max_object: u64) {
 /// Blob LRU bytes held and budget, and scan pool size (for `/metrics`).
 pub(crate) fn stats() -> (u64, u64, usize) {
     let e = engine();
-    (e.blobs.weight(), e.blobs.capacity(), e.pool.current_num_threads())
+    (
+        e.blobs.weight(),
+        e.blobs.capacity(),
+        e.pool.current_num_threads(),
+    )
 }
 
 fn engine() -> &'static Engine {

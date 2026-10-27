@@ -53,14 +53,20 @@ pub async fn run(
             None,
         ),
     };
-    let labels = vec![("primitive", primitive.name().to_owned()), ("code", code.clone())];
+    let labels = vec![
+        ("primitive", primitive.name().to_owned()),
+        ("code", code.clone()),
+    ];
     METRICS.requests.get_or_create(&labels).inc();
     METRICS
         .duration
         .get_or_create(&labels)
         .observe(elapsed.as_secs_f64());
     if let Some(r) = &reason {
-        METRICS.truncations.get_or_create(&vec![("reason", r.clone())]).inc();
+        METRICS
+            .truncations
+            .get_or_create(&vec![("reason", r.clone())])
+            .inc();
     }
     // Only the 规范 URL is logged: the raw `repo` could carry userinfo.
     tracing::info!(

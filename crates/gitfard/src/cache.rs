@@ -217,8 +217,13 @@ impl RepoCache {
         let repos = self.repos();
         let size = |url: &String| dir_size(&self.path(url));
         let used = dir_size(&self.root.join("tmp")) + repos.iter().map(size).sum::<u64>();
-        let warm: u64 = repos.iter().filter(|u| cfg.warm_list.contains(u)).map(size).sum();
-        let free = rustix::fs::statvfs(&self.root).map_or(0, |s| s.f_bavail.saturating_mul(s.f_frsize));
+        let warm: u64 = repos
+            .iter()
+            .filter(|u| cfg.warm_list.contains(u))
+            .map(size)
+            .sum();
+        let free =
+            rustix::fs::statvfs(&self.root).map_or(0, |s| s.f_bavail.saturating_mul(s.f_frsize));
         Some(DiskStatus {
             used,
             budget: cfg.cache.disk_budget,
@@ -367,9 +372,17 @@ impl RepoCache {
             let res = run(fetch).await;
             self.record(url, &res);
             let ok = if res.is_ok() { "ok" } else { "error" };
-            METRICS.fetches.get_or_create(&vec![("result", ok.into())]).inc();
-            if self.config().is_some_and(|c| c.warm_list.iter().any(|w| w == url)) {
-                let g = METRICS.warm_fetch_failures.get_or_create(&vec![("repo", url.into())]);
+            METRICS
+                .fetches
+                .get_or_create(&vec![("result", ok.into())])
+                .inc();
+            if self
+                .config()
+                .is_some_and(|c| c.warm_list.iter().any(|w| w == url))
+            {
+                let g = METRICS
+                    .warm_fetch_failures
+                    .get_or_create(&vec![("repo", url.into())]);
                 if res.is_ok() {
                     g.set(0);
                 } else {
@@ -472,7 +485,10 @@ impl RepoCache {
             tokio::spawn(async move {
                 let res = this.clone_repo(&job.url, job.cred.as_ref()).await;
                 let ok = if res.is_ok() { "ok" } else { "error" };
-                METRICS.clones.get_or_create(&vec![("result", ok.into())]).inc();
+                METRICS
+                    .clones
+                    .get_or_create(&vec![("result", ok.into())])
+                    .inc();
                 let res = match res {
                     Ok(()) => {
                         tracing::info!(url = job.url, "cloned");

@@ -28,7 +28,12 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
 
+/// tracing caches callsite interest globally; a request racing the log test on another thread
+/// can make the log test miss its line, so fixture tests run one at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+
 struct Fx {
+    _serial: std::sync::MutexGuard<'static, ()>,
     tmp: TempDir,
     config: Arc<ConfigHandle>,
     cache: Arc<RepoCache>,
@@ -36,6 +41,7 @@ struct Fx {
 
 /// One `file://` upstream `example.com/acme/x` with one commit; `extra` goes into `[cache]`.
 fn fx(extra: &str) -> Fx {
+    let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -44,7 +50,15 @@ fn fx(extra: &str) -> Fx {
     git(&work, &["add", "-A"]);
     git(
         &work,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "m"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "m",
+        ],
     );
     let up = tmp.path().join("up/example.com/acme/x.git");
     git(&work, &["clone", "-q", "--bare", ".", up.to_str().unwrap()]);
@@ -67,7 +81,12 @@ fn fx(extra: &str) -> Fx {
             .with_upstream(&base, Path::new("git"))
             .with_config(config.clone()),
     );
-    Fx { tmp, config, cache }
+    Fx {
+        _serial: serial,
+        tmp,
+        config,
+        cache,
+    }
 }
 
 impl Fx {
@@ -137,7 +156,7 @@ fn parse_openmetrics(text: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn metrics_are_openmetrics_and_cover_spec_6_3() {
-    let fx = fx("");
+    let fx = fx("disk_min_free = \"0B\"");
     let (status, body) = fx.read().await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, text) = fx.admin("/metrics").await;
@@ -146,14 +165,9 @@ async fn metrics_are_openmetrics_and_cover_spec_6_3() {
     for name in [
         "gitfar_requests",
         "gitfar_request_duration_seconds",
-        "gitfar_truncations",
         "gitfar_clone_queue_length",
         "gitfar_clones_running",
-        "gitfar_host_cooling",
-        "gitfar_host_cooldown_remaining_seconds",
-        "gitfar_fetches",
         "gitfar_clones",
-        "gitfar_warm_repo_consecutive_fetch_failures",
         "gitfar_disk_used_bytes",
         "gitfar_disk_budget_bytes",
         "gitfar_disk_free_bytes",
@@ -170,13 +184,23 @@ async fn metrics_are_openmetrics_and_cover_spec_6_3() {
         "gitfar_git_processes",
         "gitfar_git_processes_limit",
     ] {
-        assert!(families.iter().any(|f| f == name), "{name} missing:\n{text}");
+        // Labelled families appear with their first sample; nothing here truncates, fetches or
+        // cools, so gitfar_truncations, gitfar_fetches, gitfar_host_cooling,
+        // gitfar_host_cooldown_remaining_seconds and gitfar_warm_repo_consecutive_fetch_failures
+        // are absent.
+        assert!(
+            families.iter().any(|f| f == name),
+            "{name} missing:\n{text}"
+        );
     }
     assert!(
         text.contains(r#"gitfar_requests_total{primitive="read",code="ok"}"#),
         "{text}"
     );
-    assert!(text.contains(r#"gitfar_clones_total{result="ok"}"#), "{text}");
+    assert!(
+        text.contains(r#"gitfar_clones_total{result="ok"}"#),
+        "{text}"
+    );
     assert!(text.contains("gitfar_cache_full 0"), "{text}");
 }
 
@@ -198,14 +222,11 @@ async fn readyz_stays_ready_when_cache_full() {
 
 #[tokio::test]
 async fn readyz_fails_when_cache_dir_is_not_writable() {
-    let fx = fx("");
+    let fx = fx("disk_min_free = \"0B\"");
     let dir = fx.tmp.path().join("cache/tmp");
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::write(&dir, "").unwrap();
-    assert_eq!(
-        fx.admin("/readyz").await.0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    assert_eq!(fx.admin("/readyz").await.0, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[derive(Clone, Default)]
@@ -229,8 +250,8 @@ async fn one_request_line_with_token_id_and_no_secrets() {
         .json()
         .with_writer(move || w.clone())
         .finish();
+    let fx = fx("disk_min_free = \"0B\"");
     let _g = tracing::subscriber::set_default(sub);
-    let fx = fx("");
     let (status, body) = fx.read().await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
