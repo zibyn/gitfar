@@ -384,6 +384,7 @@ dependencies = [
  "http-body-util",
  "jiff",
  "rand",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

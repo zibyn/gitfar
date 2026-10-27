@@ -89,7 +89,7 @@ async fn main() -> ExitCode {
 
     let cfg = handle.current();
     let cache = match RepoCache::open(&cfg.server.cache_dir, cfg.cache.clone_concurrency) {
-        Ok(c) => Arc::new(c),
+        Ok(c) => Arc::new(c.with_config(handle.clone())),
         Err(e) => {
             eprintln!("gitfard: {e}");
             return ExitCode::FAILURE;
@@ -101,6 +101,19 @@ async fn main() -> ExitCode {
             Err(_) => tracing::warn!(url, "warm_list entry outside the allowlist; skipped"),
         }
     }
+    tokio::spawn({
+        let cache = cache.clone();
+        async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                every.tick().await;
+                let now = jiff::Zoned::now();
+                cache
+                    .tick(now.hour() as u16 * 60 + now.minute() as u16)
+                    .await;
+            }
+        }
+    });
 
     let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
