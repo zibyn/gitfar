@@ -26,6 +26,7 @@ use tokio::process::Command;
 use tokio::sync::{watch, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::timeout_at;
 
+use crate::admin::METRICS;
 use crate::authz::authorize;
 use crate::config::{Config, ConfigHandle, Credential, Upstream};
 
@@ -210,6 +211,33 @@ impl RepoCache {
         v
     }
 
+    /// Disk usage against the budget and floor (`None` without a config). Walks the cache dir.
+    pub fn disk(&self) -> Option<DiskStatus> {
+        let cfg = self.config()?;
+        let repos = self.repos();
+        let size = |url: &String| dir_size(&self.path(url));
+        let used = dir_size(&self.root.join("tmp")) + repos.iter().map(size).sum::<u64>();
+        let warm: u64 = repos.iter().filter(|u| cfg.warm_list.contains(u)).map(size).sum();
+        let free = rustix::fs::statvfs(&self.root).map_or(0, |s| s.f_bavail.saturating_mul(s.f_frsize));
+        Some(DiskStatus {
+            used,
+            budget: cfg.cache.disk_budget,
+            free,
+            min_free: cfg.cache.disk_min_free,
+            cache_full: self.disk_low(),
+            warm_list_bytes: warm,
+            warm_list_over_budget: warm > cfg.cache.disk_budget,
+        })
+    }
+
+    /// The cache dir accepts new files (for `/readyz`).
+    pub fn writable(&self) -> bool {
+        let probe = self.root.join("tmp").join("readyz");
+        let ok = File::create(&probe).is_ok();
+        let _ = fs::remove_file(&probe);
+        ok
+    }
+
     /// Where the bare clone of canonical `url` lives (whether or not it is cached yet).
     pub fn path(&self, url: &str) -> PathBuf {
         self.root.join("repos").join(format!("{url}.git"))
@@ -338,6 +366,16 @@ impl RepoCache {
             ]);
             let res = run(fetch).await;
             self.record(url, &res);
+            let ok = if res.is_ok() { "ok" } else { "error" };
+            METRICS.fetches.get_or_create(&vec![("result", ok.into())]).inc();
+            if self.config().is_some_and(|c| c.warm_list.iter().any(|w| w == url)) {
+                let g = METRICS.warm_fetch_failures.get_or_create(&vec![("repo", url.into())]);
+                if res.is_ok() {
+                    g.set(0);
+                } else {
+                    g.inc();
+                }
+            }
             match res {
                 Ok(()) => self.write_commit_graph(&path).await,
                 Err(e) => Err(e),
@@ -359,8 +397,9 @@ impl RepoCache {
             }
         }
         let auth_failed = res.as_ref().is_err_and(|e| is_auth_failure(&e.stderr));
-        if let Err(e) = &res {
-            tracing::warn!(url, error = %e, auth_failed, "fetch failed");
+        match &res {
+            Ok(()) => tracing::info!(url, "fetched"),
+            Err(e) => tracing::warn!(url, error = %e, auth_failed, "fetch failed"),
         }
         self.fresh_state(url, |f| {
             let now = Instant::now();
@@ -431,8 +470,14 @@ impl RepoCache {
             st.running += 1;
             let this = self.clone();
             tokio::spawn(async move {
-                let res = match this.clone_repo(&job.url, job.cred.as_ref()).await {
-                    Ok(()) => Ok(()),
+                let res = this.clone_repo(&job.url, job.cred.as_ref()).await;
+                let ok = if res.is_ok() { "ok" } else { "error" };
+                METRICS.clones.get_or_create(&vec![("result", ok.into())]).inc();
+                let res = match res {
+                    Ok(()) => {
+                        tracing::info!(url = job.url, "cloned");
+                        Ok(())
+                    }
                     Err(Failed::RateLimited) => {
                         let mut st = this.state.lock().unwrap();
                         st.running -= 1;
@@ -685,6 +730,7 @@ impl RepoCache {
             }
             if !cfg.warm_list.contains(&url) {
                 tracing::info!(url, size, "evicting");
+                METRICS.evictions.inc();
                 self.remove(&url).await;
                 total -= size;
             }
@@ -721,7 +767,10 @@ impl RepoCache {
                 e => e,
             };
             match res {
-                Ok(()) => touch(&marker),
+                Ok(()) => {
+                    tracing::info!(url, "gc finished");
+                    touch(&marker)
+                }
                 Err(e) => tracing::warn!(url, error = %e, "gc failed"),
             }
         }
@@ -776,6 +825,18 @@ impl RepoCache {
         }
         c
     }
+}
+
+/// Disk state for `/status` and `/metrics`.
+#[derive(Debug, serde::Serialize)]
+pub struct DiskStatus {
+    pub used: u64,
+    pub budget: u64,
+    pub free: u64,
+    pub min_free: u64,
+    pub cache_full: bool,
+    pub warm_list_bytes: u64,
+    pub warm_list_over_budget: bool,
 }
 
 /// Why a clone failed, as the clone queue acts on it.

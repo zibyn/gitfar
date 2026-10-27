@@ -15,6 +15,7 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 hex = "0.4"
 jiff = { version = "0.2", features = ["serde"] }
+prometheus-client = "0.25"
 quick_cache = "0.7"
 rand = "0.10"
 rayon = "1.12"

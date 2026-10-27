@@ -16,31 +16,94 @@ use std::time::Instant;
 use gitfar_proto::{Cursor, ErrorBody, ErrorCode, Params, Primitive, Request, Resume};
 use gix::ObjectId;
 
+use crate::admin::METRICS;
 use crate::authz::{authorize, canonicalize};
 use crate::cache::RepoCache;
 use crate::config::ConfigHandle;
+use crate::http::TokenCtx;
 
 /// Hard cap on the UTF-8 bytes of a response's `text` (spec §2.2).
 const BYTE_CAP: usize = 64 * 1024;
 
-/// Runs one primitive request (fresh params or `{cursor}`) for a caller with 令牌范围 `scope`
-/// and returns the serialized response object.
+/// Runs one primitive request (fresh params or `{cursor}`) for the authenticated `token` and
+/// returns the serialized response object. Logs one request line and records request metrics.
 pub async fn run(
     config: &ConfigHandle,
     cache: &Arc<RepoCache>,
-    scope: Option<&[String]>,
+    token: &TokenCtx,
     primitive: Primitive,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, ErrorBody> {
+    let start = Instant::now();
+    let mut seen = Seen::default();
+    let res = run_logged(config, cache, token, primitive, body, &mut seen).await;
+    let elapsed = start.elapsed();
+    let (code, commit, reason) = match &res {
+        Ok(v) => (
+            "ok".to_owned(),
+            v["resolved_commit"].as_str().map(str::to_owned),
+            v["truncated_reason"].as_str().map(str::to_owned),
+        ),
+        Err(e) => (
+            serde_json::to_value(e.error.code)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            None,
+            None,
+        ),
+    };
+    let labels = vec![("primitive", primitive.name().to_owned()), ("code", code.clone())];
+    METRICS.requests.get_or_create(&labels).inc();
+    METRICS
+        .duration
+        .get_or_create(&labels)
+        .observe(elapsed.as_secs_f64());
+    if let Some(r) = &reason {
+        METRICS.truncations.get_or_create(&vec![("reason", r.clone())]).inc();
+    }
+    // Only the 规范 URL is logged: the raw `repo` could carry userinfo.
+    tracing::info!(
+        primitive = primitive.name(),
+        repo = seen.repo,
+        rev = seen.rev,
+        resolved_commit = commit,
+        elapsed_ms = elapsed.as_millis() as u64,
+        truncated_reason = reason,
+        code,
+        token = token.token_id,
+        "request"
+    );
+    res
+}
+
+/// What the request log needs from inside the pipeline.
+#[derive(Default)]
+struct Seen {
+    repo: Option<String>,
+    rev: Option<String>,
+}
+
+async fn run_logged(
+    config: &ConfigHandle,
+    cache: &Arc<RepoCache>,
+    token: &TokenCtx,
+    primitive: Primitive,
+    body: serde_json::Value,
+    seen: &mut Seen,
+) -> Result<serde_json::Value, ErrorBody> {
+    let scope = token.scope.as_deref();
     // A fresh request is a resume from offset zero; a cursor carries the SHA it is pinned to.
     let (job, pinned) = match Request::parse(primitive, body)? {
         Request::Fresh(p) => (fresh(p), None),
         Request::Resume(c) => (c.resume, Some(c.resolved_commit)),
     };
     let (repo, rev) = target(&job);
+    seen.rev = rev.map(str::to_owned);
     let cfg = config.current();
     let deadline = Instant::now() + cfg.server.request_deadline;
     let url = canonicalize(repo).map_err(|e| ErrorBody::new(ErrorCode::InvalidArgument, e))?;
+    seen.repo = Some(url.clone());
     let cred = authorize(&cfg, scope, &url)
         .map_err(|code| ErrorBody::new(code, "repository not found"))?;
     let path = cache.ensure(&url, cred, cfg.cache.warm_wait).await?;
@@ -129,6 +192,12 @@ async fn execute(
     })
     .await
     .map_err(internal)?
+}
+
+/// git CLI children running now and their limit (for `/metrics`).
+pub(crate) fn git_processes() -> (usize, usize) {
+    let limit = git::limit();
+    (limit - git::semaphore().available_permits(), limit)
 }
 
 fn fresh(p: Params) -> Resume {
