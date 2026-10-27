@@ -743,7 +743,7 @@ impl RepoCache {
 
     /// A hermetic git child. The credential travels as env-injected `http.<prefix>.extraHeader`
     /// (not `-c`, which shows in /proc/*/cmdline), so it never lands in the repo's config.
-    fn git(&self, cred: Option<&Credential>) -> Command {
+    pub(crate) fn git(&self, cred: Option<&Credential>) -> Command {
         let mut c = Command::new(&self.git);
         c.env_clear()
             .envs(std::env::var_os("PATH").map(|p| ("PATH", p)))
