@@ -415,21 +415,36 @@ fn run(cli: Cli) -> Result<u8, Fail> {
     let (prim, body) = request(cli.cmd);
     let endpoint = format!("{base}/v1/{}", prim.name());
     let deadline = Instant::now() + Duration::from_secs(cli.wait);
+    // The last `repo_warming`, once retrying.
+    let mut warming: Option<SendError> = None;
     let v = loop {
-        match send(auth(http.post(&endpoint).json(&body)), cli.json) {
+        let mut req = auth(http.post(&endpoint).json(&body));
+        if warming.is_some() {
+            // A retry must not run past --wait either; the last one, sent at the deadline, gets 1 s.
+            let left = deadline.saturating_duration_since(Instant::now());
+            req = req.timeout(left.max(Duration::from_secs(1)));
+        }
+        match send(req, cli.json) {
+            Err(SendError::TimedOut) if warming.is_some() => {
+                return Err(warming.expect("checked").into())
+            }
             Err(w @ Warming { .. }) if deadline <= Instant::now() => return Err(w.into()),
-            Err(Warming {
-                retry_after,
-                progress,
-                ..
-            }) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let pause = retry_after.min(left);
-                eprintln!(
-                    "gitfar: repo warming ({progress}); retrying in {}s",
-                    pause.as_secs_f32().ceil()
-                );
-                std::thread::sleep(pause);
+            Err(w @ Warming { .. }) => {
+                if let Warming {
+                    retry_after,
+                    progress,
+                    ..
+                } = &w
+                {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let pause = (*retry_after).min(left);
+                    eprintln!(
+                        "gitfar: repo warming ({progress}); retrying in {}s",
+                        pause.as_secs_f32().ceil()
+                    );
+                    std::thread::sleep(pause);
+                }
+                warming = Some(w);
             }
             other => break other?,
         }
@@ -468,12 +483,15 @@ enum SendError {
         body: Option<String>,
     },
     Fail(Fail),
+    /// The request's own timeout ran out.
+    TimedOut,
 }
 
 impl From<SendError> for Fail {
     fn from(e: SendError) -> Fail {
         match e {
             SendError::Fail(f) => f,
+            SendError::TimedOut => Fail::new("network", "request timed out", 6),
             Warming { message, body, .. } => {
                 if let Some(b) = body {
                     println!("{b}");
@@ -486,7 +504,10 @@ impl From<SendError> for Fail {
 
 /// One HTTP call. With `json`, the body (success or error) is echoed to stdout.
 fn send(req: reqwest::blocking::RequestBuilder, json: bool) -> Result<Value, SendError> {
-    let net = |e: reqwest::Error| SendError::Fail(Fail::new("network", e, 6));
+    let net = |e: reqwest::Error| match e.is_timeout() {
+        true => SendError::TimedOut,
+        false => SendError::Fail(Fail::new("network", e, 6)),
+    };
     let r = req.send().map_err(net)?;
     let status = r.status();
     let retry_after = r
