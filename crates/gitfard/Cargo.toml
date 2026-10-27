@@ -5,14 +5,22 @@ version.workspace = true
 
 [dependencies]
 arc-swap = "1"
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 gitfar-proto.workspace = true
+hex = "0.4"
 jiff = { version = "0.2", features = ["serde"] }
+rand = "0.10"
 serde.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+serde_json.workspace = true
+sha2 = "0.11"
+subtle = "2.6"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 
 [dev-dependencies]
+http-body-util = "0.1"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
