@@ -1,0 +1,7 @@
+[package]
+name = "gitfard"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gitfar-proto.workspace = true
