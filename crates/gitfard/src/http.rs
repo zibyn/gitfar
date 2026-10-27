@@ -34,6 +34,7 @@ pub fn router(config: Arc<ConfigHandle>, cache: Arc<RepoCache>) -> Router {
         .route("/v1/show", prim(Primitive::Show))
         .route("/v1/blame", prim(Primitive::Blame))
         .route("/v1/grep", prim(Primitive::Grep))
+        .nest_service("/mcp", crate::mcp::service(config.clone(), cache.clone()))
         .layer(middleware::from_fn_with_state(config, bearer))
         .route("/healthz", get(|| async { "ok" }))
 }
