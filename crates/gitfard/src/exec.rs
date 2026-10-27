@@ -1,11 +1,13 @@
 //! 检索执行: the request pipeline shared by HTTP and MCP (spec §1.1 ②–⑧) and its executors (§4.6).
 
+pub mod grep;
 mod list;
 mod read;
 
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gitfar_proto::{Cursor, ErrorBody, ErrorCode, Params, Primitive, Request, Resume};
 use gix::ObjectId;
@@ -33,13 +35,23 @@ pub async fn run(
     };
     let (repo, rev) = target(&job);
     let cfg = config.current();
+    let deadline = Instant::now() + cfg.server.request_deadline;
     let url = canonicalize(repo).map_err(|e| ErrorBody::new(ErrorCode::InvalidArgument, e))?;
     let cred = authorize(&cfg, scope, &url)
         .map_err(|code| ErrorBody::new(code, "repository not found"))?;
     let path = cache.ensure(&url, cred, cfg.cache.warm_wait).await?;
     let resumed = pinned.is_some();
     let rev = pinned.unwrap_or_else(|| rev.unwrap_or("HEAD").to_owned());
-    let attempt = || execute(cache, &url, path.clone(), rev.clone(), job.clone());
+    let attempt = || {
+        execute(
+            cache,
+            &url,
+            path.clone(),
+            rev.clone(),
+            job.clone(),
+            deadline,
+        )
+    };
     match attempt().await {
         // Only a fresh rev can be unknown because our mirror is stale; a cursor's SHA was resolved here.
         Err(e) if e.error.code == ErrorCode::RevNotFound && !resumed => {
@@ -57,6 +69,7 @@ async fn execute(
     path: PathBuf,
     rev: String,
     job: Resume,
+    deadline: Instant,
 ) -> Result<serde_json::Value, ErrorBody> {
     let guard = cache.lock(url).read_owned().await;
     tokio::task::spawn_blocking(move || {
@@ -76,6 +89,9 @@ async fn execute(
             }
             Resume::List { params, skipped } => {
                 serde_json::to_value(list::run(&commit, params, skipped)?)
+            }
+            Resume::Grep { params, path, line } => {
+                serde_json::to_value(grep::run(&commit, params, (path, line), deadline)?)
             }
             other => {
                 return Err(internal(format!(
