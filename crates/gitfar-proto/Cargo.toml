@@ -3,6 +3,7 @@ name = "gitfar-proto"
 description = "gitfar shared protocol types: primitive params, responses, errors, cursors"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 base64.workspace = true

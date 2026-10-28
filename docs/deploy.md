@@ -4,13 +4,15 @@
 
 ## 1. 获取二进制或镜像
 
-**OCI 镜像**只含 `gitfard` 与 Debian 发行版的 git（trixie 为 2.47.x；见仓库根目录 `Dockerfile`）：
+**OCI 镜像**只含 `gitfard` 与 Debian 发行版的 git（trixie 为 2.47.x；见仓库根目录 `Dockerfile`）。推送 `v*` 标签时 CI 构建 linux/amd64 镜像并发布到 ghcr，公开拉取、无需登录：
 
 ```sh
-docker build -t gitfard .
+docker pull ghcr.io/zibyn/gitfard:v0.1    # 标签与 Release 同名，没有 latest
 ```
 
-**裸二进制**（`gitfard` 服务端、`gitfar` CLI）：推送 `v*` 标签时 CI 把 linux x86_64 版本附到 GitHub Release；也可自行构建：
+也可从源码构建：`docker build -t gitfard .`（下文命令把镜像名换成 `gitfard` 即可）。
+
+**裸二进制**（`gitfard` 服务端、`gitfar` CLI）：推送 `v*` 标签时 CI 把 linux x86_64 版本附到 [GitHub Release](https://github.com/zibyn/gitfar/releases)；也可自行构建：
 
 ```sh
 cargo build --release -p gitfard -p gitfar   # 产物在 target/release/
@@ -39,7 +41,7 @@ docker run -d --name gitfard \
   -v "$PWD/gitfard.toml:/etc/gitfar/gitfard.toml:ro" \
   -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 \
   --stop-timeout 40 \
-  gitfard
+  ghcr.io/zibyn/gitfard:v0.1
 curl -fsS http://127.0.0.1:9090/readyz
 ```
 
@@ -93,7 +95,7 @@ kill -HUP "$(pidof gitfard)"     # 或 docker kill -s HUP gitfard
 
 ```sh
 gitfard token new --id alice-laptop --scope github.com/acme --expires 2027-01-01T00:00:00Z
-# docker：docker run --rm gitfard token new --id alice-laptop
+# docker：docker run --rm ghcr.io/zibyn/gitfard:v0.1 token new --id alice-laptop
 ```
 
 令牌原文只打印这一次，交给使用者。把同时打印的 `[[client_tokens]]` 条目粘进配置，然后 SIGHUP。没有任何令牌时所有请求都是 401。

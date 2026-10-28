@@ -2,6 +2,7 @@
 name = "gitfard"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 arc-swap = "1"

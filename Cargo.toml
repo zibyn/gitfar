@@ -5,6 +5,7 @@ members = ["crates/gitfar-proto", "crates/gitfard", "crates/gitfar"]
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "MIT"
 
 [workspace.dependencies]
 gitfar-proto = { path = "crates/gitfar-proto" }
