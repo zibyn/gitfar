@@ -47,6 +47,20 @@ curl -fsS http://127.0.0.1:9090/readyz
 
 镜像以 uid 10001 运行；绑定宿主目录作缓存时先 `chown 10001` 该目录。`--stop-timeout` 要比 `request_deadline` 长，SIGTERM 后进行中的请求最多再跑一个截止时间。
 
+### 用 docker compose 运行
+
+`deploy/docker-compose.yaml` 与上面的 `docker run` 等价（命名卷 `gitfar-cache`、端口只绑 `127.0.0.1`、`stop_grace_period: 40s`），并带健康检查：每 30 s 用 curl 请求容器内的 `/readyz`。在 `deploy/` 目录下：
+
+```sh
+docker compose up -d
+docker compose ps                                              # STATUS 应为 healthy
+docker compose run --rm gitfard token new --id alice-laptop    # 签发令牌，条目粘进 gitfard.toml
+docker compose kill -s HUP gitfard                             # 热加载
+docker compose logs -f gitfard
+```
+
+健康检查写死了端口 9090；改了 `admin_listen` 的端口要同步改 `healthcheck`。缓存要放宿主目录时，把 `gitfar-cache:/var/lib/gitfar` 换成 `./cache:/var/lib/gitfar`，删掉文件末尾的顶层 `volumes:`，并先 `mkdir -p cache && sudo chown 10001:10001 cache`（目录不存在时 Docker 会以 root 创建，gitfard 写不进去）。
+
 ## 3. TLS（反向代理）
 
 `gitfard` 只提供明文 HTTP，TLS 交给反向代理终止。代理要把原始 `Host` 转发过去（与 `public_hosts` 一致），并且不要缓冲响应或设置短于 `request_deadline` 的超时。
