@@ -24,14 +24,14 @@ src/main.rs:12:fn main() {
 Run the server (see [docs/deploy.md](docs/deploy.md) for configuration, TLS and tokens):
 
 ```sh
-docker pull ghcr.io/zibyn/gitfard:v0.1
+docker pull ghcr.io/zibyn/gitfard:v0.1.1
 docker volume create gitfar-cache
 docker run -d --name gitfard \
   -v gitfar-cache:/var/lib/gitfar \
   -v "$PWD/gitfard.toml:/etc/gitfar/gitfard.toml:ro" \
   -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 \
-  ghcr.io/zibyn/gitfard:v0.1
-docker run --rm ghcr.io/zibyn/gitfard:v0.1 token new --id alice-laptop
+  ghcr.io/zibyn/gitfard:v0.1.1
+docker run --rm ghcr.io/zibyn/gitfard:v0.1.1 token new --id alice-laptop
 ```
 
 Start from [`deploy/gitfard.toml`](deploy/gitfard.toml), paste the printed `[[client_tokens]]` entry into it, and `docker kill -s HUP gitfard`.

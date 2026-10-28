@@ -1,0 +1,25 @@
+# gitfard with a persistent cache (docs/deploy.md). From this directory:
+#   docker compose up -d
+#   docker compose run --rm gitfard token new --id alice-laptop   # paste the entry into gitfard.toml
+#   docker compose kill -s HUP gitfard                             # reload config
+services:
+  gitfard:
+    image: ghcr.io/zibyn/gitfard:v0.1.1
+    restart: unless-stopped
+    volumes:
+      - gitfar-cache:/var/lib/gitfar
+      - ./gitfard.toml:/etc/gitfar/gitfard.toml:ro
+    ports:
+      - "127.0.0.1:8080:8080" # API; put a TLS reverse proxy in front
+      - "127.0.0.1:9090:9090" # admin (metrics, readyz); unauthenticated
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9090/readyz"] # port = admin_listen
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # Longer than request_deadline, so in-flight requests finish after SIGTERM.
+    stop_grace_period: 40s
+
+volumes:
+  gitfar-cache:

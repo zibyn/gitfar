@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "gitfar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "clap",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "gitfar-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "schemars",
@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "gitfard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "axum",
